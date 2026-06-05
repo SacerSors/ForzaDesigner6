@@ -72,10 +72,12 @@ def random_shape(
     h: int,
     allowed_types: list[ShapeType],
     max_size_frac: float | None = None,
+    cx: float | None = None,
+    cy: float | None = None,
 ) -> Shape:
     type_name = rng.choice(allowed_types)
     cls = SHAPE_REGISTRY[type_name]
-    return cls.random(rng, w, h, max_size_frac=max_size_frac)
+    return cls.random(rng, w, h, max_size_frac=max_size_frac, cx=cx, cy=cy)
 
 
 def shape_from_json(data: dict) -> Shape:

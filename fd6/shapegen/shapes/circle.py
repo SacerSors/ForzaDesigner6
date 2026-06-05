@@ -58,14 +58,14 @@ class Circle(Shape):
         )
 
     @classmethod
-    def random(cls, rng: random.Random, w: int, h: int, max_size_frac: float | None = None) -> "Circle":
+    def random(cls, rng: random.Random, w: int, h: int, max_size_frac: float | None = None, cx: float | None = None, cy: float | None = None) -> "Circle":
         if max_size_frac is None:
             r_cap = max(2.0, min(w, h) / 8.0)
         else:
             r_cap = max(2.0, (min(w, h) * max_size_frac) / 2.0)
         return cls(
             color=(rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255), 128),
-            x=rng.uniform(0, w - 1), y=rng.uniform(0, h - 1),
+            x=cx if cx is not None else rng.uniform(0, w - 1), y=cy if cy is not None else rng.uniform(0, h - 1),
             r=rng.uniform(1, r_cap),
         )
 

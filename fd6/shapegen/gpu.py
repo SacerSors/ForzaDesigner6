@@ -422,8 +422,32 @@ class OpenCLEllipseSearcher:
         cl.enqueue_copy(self.queue, self._buf_canvas, cur.ravel())
         full_sq = float((((cur - self._target_np) ** 2) * self._edge_np[:, :, None]).sum())
 
+        # Smart Initialization for GPU
+        diff = np.abs(cur - self._target_np.astype(np.float32)).mean(axis=2)
+        if self._has_alpha:
+            diff = diff * (self._alpha_np > 0).astype(np.float32)
+        if getattr(self, "_edge_np", None) is not None:
+            diff = diff * self._edge_np
+        diff = diff + diff.max() * 0.05
+        diff_flat = diff.flatten()
+        diff_sum = diff_flat.sum()
+        if diff_sum > 0:
+            probs = diff_flat / diff_sum
+        else:
+            probs = np.ones_like(diff_flat) / len(diff_flat)
+
+        rs = np.random.RandomState(rng.randint(0, 2**31 - 1))
+        sampled_indices = rs.choice(len(probs), size=max(1, n_random), p=probs)
+        sampled_ys = sampled_indices // self.w
+        sampled_xs = sampled_indices % self.w
+
         params = random_ellipse_params(self.w, self.h, max(1, n_random), max_size_frac, rng)
+        # Override initial x, y with smart placement
+        params[:, 0] = sampled_xs.astype(np.float32)
+        params[:, 1] = sampled_ys.astype(np.float32)
+
         scores = self._score(params, full_sq, self._tile_for(params, self.w, self.h))
+
         bi = int(np.argmin(scores))
         best_score = float(scores[bi])
         best = params[bi].copy()
@@ -481,9 +505,46 @@ class EllipseBatchSearcher:
         # Full-canvas weighted squared error (constant for this canvas snapshot).
         full_sq = float(((cur - self.target) ** 2 * self.edge[:, :, None]).sum().item())
 
+        # Smart Initialization for GPU
+        diff = xp.abs(cur - self.target).mean(axis=2)
+        if self.alpha is not None:
+            diff = diff * (self.alpha > 0).astype(xp.float32)
+        if getattr(self, "edge", None) is not None:
+            diff = diff * self.edge
+        diff = diff + diff.max() * 0.05
+        diff_flat = xp.reshape(diff, -1)
+        diff_sum = diff_flat.sum()
+
+        # We need numpy to sample using weights since cupy doesn't support p in choice easily
+        try:
+            diff_np = diff_flat.get() if hasattr(diff_flat, 'get') else diff_flat
+            diff_sum_np = diff_sum.get() if hasattr(diff_sum, 'get') else diff_sum
+        except Exception:
+            diff_np = np.array(diff_flat)
+            diff_sum_np = np.sum(diff_np)
+
+        if diff_sum_np > 0:
+            probs = diff_np / diff_sum_np
+        else:
+            probs = np.ones_like(diff_np) / len(diff_np)
+
+        rs = np.random.RandomState(rng.randint(0, 2**31 - 1))
+        sampled_indices_np = rs.choice(len(probs), size=max(1, n_random), p=probs)
+
+        sampled_indices = xp.asarray(sampled_indices_np)
+        sampled_ys = sampled_indices // self.w
+        sampled_xs = sampled_indices % self.w
+
         # ── random search ──
         params = self._random_params(max(1, n_random), max_size_frac, rng)
+        # Override initial x, y with smart placement
+        params_np = params.get() if hasattr(params, 'get') else params
+        params_np[:, 0] = sampled_indices_np % self.w
+        params_np[:, 1] = sampled_indices_np // self.w
+        params = xp.asarray(params_np)
+
         scores, _colors = self._score_batch(params, cur, full_sq)
+
         bi = int(xp.argmin(scores).item())
         best_score = float(scores[bi].item())
         best = params[bi].copy()

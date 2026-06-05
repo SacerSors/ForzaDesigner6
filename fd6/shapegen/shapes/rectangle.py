@@ -57,7 +57,7 @@ class Rectangle(Shape):
         )
 
     @classmethod
-    def random(cls, rng: random.Random, w: int, h: int, max_size_frac: float | None = None) -> "Rectangle":
+    def random(cls, rng: random.Random, w: int, h: int, max_size_frac: float | None = None, cx: float | None = None, cy: float | None = None) -> "Rectangle":
         if max_size_frac is None:
             hw_cap = max(2.0, w / 8.0)
             hh_cap = max(2.0, h / 8.0)
@@ -66,7 +66,7 @@ class Rectangle(Shape):
             hh_cap = max(2.0, (h * max_size_frac) / 2.0)
         return cls(
             color=(rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255), 128),
-            x=rng.uniform(0, w - 1), y=rng.uniform(0, h - 1),
+            x=cx if cx is not None else rng.uniform(0, w - 1), y=cy if cy is not None else rng.uniform(0, h - 1),
             hw=rng.uniform(1, hw_cap), hh=rng.uniform(1, hh_cap),
         )
 
@@ -136,7 +136,7 @@ class RotatedRectangle(Shape):
         )
 
     @classmethod
-    def random(cls, rng: random.Random, w: int, h: int, max_size_frac: float | None = None) -> "RotatedRectangle":
+    def random(cls, rng: random.Random, w: int, h: int, max_size_frac: float | None = None, cx: float | None = None, cy: float | None = None) -> "RotatedRectangle":
         if max_size_frac is None:
             hw_cap = max(2.0, w / 8.0)
             hh_cap = max(2.0, h / 8.0)
@@ -145,7 +145,7 @@ class RotatedRectangle(Shape):
             hh_cap = max(2.0, (h * max_size_frac) / 2.0)
         return cls(
             color=(rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255), 128),
-            x=rng.uniform(0, w - 1), y=rng.uniform(0, h - 1),
+            x=cx if cx is not None else rng.uniform(0, w - 1), y=cy if cy is not None else rng.uniform(0, h - 1),
             hw=rng.uniform(1, hw_cap), hh=rng.uniform(1, hh_cap),
             angle=rng.uniform(0, 180),
         )

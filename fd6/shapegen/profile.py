@@ -25,6 +25,7 @@ class Profile:
     # are present, else CPU), "cpu" (force the multiprocess CPU path), or "gpu"
     # (force CuPy; silently falls back to CPU if unavailable or it errors).
     compute_backend: str = "auto"
+    global_refinement: bool = False
 
     def to_ini(self) -> str:
         cp = configparser.ConfigParser()
@@ -43,6 +44,7 @@ class Profile:
             "stopAt": str(self.stop_at),
             "shapeTypes": ",".join(self.shape_types),
             "computeBackend": self.compute_backend,
+            "globalRefinement": str(self.global_refinement).lower(),
         }
         from io import StringIO
         buf = StringIO()
@@ -95,6 +97,7 @@ def load_profile(name: str, text: str) -> Profile:
         p.shape_types = _parse_str_list(section["shapeTypes"])
     backend = getstr("computeBackend", p.compute_backend).lower().strip()
     p.compute_backend = backend if backend in ("auto", "cpu", "gpu") else "auto"
+    p.global_refinement = getstr("globalRefinement", "false").lower().strip() == "true"
     return p
 
 

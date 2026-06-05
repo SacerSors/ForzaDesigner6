@@ -171,6 +171,16 @@ class SettingsPanel(QWidget):
             "stay empty (the rest of the Forza vinyl group shows through)."
         )
         sg_layout.addWidget(self.sticker_mode_cb)
+
+        self.global_refinement_cb = QCheckBox("Enable Global Refinement", sticker_group)
+        self.global_refinement_cb.setChecked(False)
+        self.global_refinement_cb.setToolTip(
+            "Periodically revisits older shapes to see if they fit better in the current context.\n"
+            "This can produce better quality with fewer shapes, but takes a bit more time."
+        )
+        self.global_refinement_cb.stateChanged.connect(self._on_adv_changed)
+        sg_layout.addWidget(self.global_refinement_cb)
+
         layout.addWidget(sticker_group)
 
         # Shape types. Only rotated_ellipse is confirmed-working for the current
@@ -311,7 +321,7 @@ class SettingsPanel(QWidget):
         except Exception:
             return
         # Mirror into advanced widgets without re-emitting per-spinbox.
-        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
+        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every, self.global_refinement_cb):
             w.blockSignals(True)
         self.stop_at.setValue(prof.stop_at)
         self.random_samples.setValue(prof.random_samples)
@@ -319,7 +329,8 @@ class SettingsPanel(QWidget):
         self.max_resolution.setValue(prof.max_resolution)
         self.max_threads.setValue(prof.max_threads)
         self.preview_every.setValue(prof.preview_every)
-        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
+        self.global_refinement_cb.setChecked(getattr(prof, "global_refinement", False))
+        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every, self.global_refinement_cb):
             w.blockSignals(False)
         for code, cb in self._shape_checks.items():
             cb.blockSignals(True)
@@ -361,6 +372,7 @@ class SettingsPanel(QWidget):
         base.preview_every = self.preview_every.value()
         base.shape_types = [code for code, cb in self._shape_checks.items() if cb.isChecked()] or ["rotated_ellipse"]
         base.compute_backend = str(self.compute_backend.currentData() or "auto")
+        base.global_refinement = self.global_refinement_cb.isChecked()
         return base
 
     def set_running(self, running: bool) -> None:

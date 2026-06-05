@@ -176,21 +176,54 @@ def _worker_independent_search(args: tuple) -> tuple:
         edge_w = _W_EDGE_WEIGHT
         rng = random.Random(seed)
 
-        # Precompute once for this batch — see precompute_canvas_error docstring.
+# Precompute once for this batch — see precompute_canvas_error docstring.
         canvas_full_sq, canvas_norm = precompute_canvas_error(canvas, target, alpha, edge_w)
+
+        # Smart Initialization: guide random placement based on current error
+        # We calculate the absolute error per pixel (with edge weights if present).
+        diff = np.abs(canvas.astype(np.float32) - target.astype(np.float32)).mean(axis=2)
+        if alpha is not None:
+            diff = diff * (alpha > 0).astype(np.float32)
+        if edge_w is not None:
+            diff = diff * edge_w
+
+        # Add a small uniform probability so we still explore the whole canvas
+        diff = diff + diff.max() * 0.05
+
+        # Flatten and create probabilities
+        diff_flat = diff.flatten()
+        diff_sum = diff_flat.sum()
+        if diff_sum > 0:
+            probs = diff_flat / diff_sum
+        else:
+            probs = np.ones_like(diff_flat) / len(diff_flat)
+
+        # Sample coordinates for guided search
+        # rng.choices can be slow with weights, so we'll use numpy here
+        # But we need to use a reproducible generator using the seed
+        rs = np.random.RandomState(seed)
+        sampled_indices = rs.choice(len(probs), size=max(1, n_random), p=probs)
+        sampled_ys = sampled_indices // w
+        sampled_xs = sampled_indices % w
 
         # Random search
         best_score = float("inf")
         best_color = None
         best_shape = None
-        for _ in range(max(1, n_random)):
-            s = random_shape(rng, w, h, types, max_size_frac=max_size_frac)
-            score, color = score_shape(s, canvas, target, alpha,
-                                       canvas_full_sq=canvas_full_sq,
-                                       canvas_norm=canvas_norm,
-                                       edge_weight=edge_w)
-            if score < best_score:
-                best_score, best_color, best_shape = score, color, s
+        for i in range(max(1, n_random)):
+            cx = float(sampled_xs[i])
+            cy = float(sampled_ys[i])
+
+            # Test all types at this coordinate and keep the best
+            for shape_type in types:
+                s = random_shape(rng, w, h, [shape_type], max_size_frac=max_size_frac, cx=cx, cy=cy)
+                score, color = score_shape(s, canvas, target, alpha,
+                                           canvas_full_sq=canvas_full_sq,
+                                           canvas_norm=canvas_norm,
+                                           edge_weight=edge_w)
+                if score < best_score:
+                    best_score, best_color, best_shape = score, color, s
+
         if best_shape is None:
             return (float("inf"), None, None, None)
 
@@ -466,14 +499,6 @@ class Engine:
         types = [t for t in p.shape_types if t]
         if not types:
             types = ["rotated_ellipse"]
-        # Per-iteration type rotation. Without this, every worker picks a type
-        # at random and ellipses (which fit organic content best) win the
-        # fitness comparison nearly every iteration, so checked rectangle /
-        # rotated_rectangle types produce zero shapes in the final JSON. With
-        # rotation, each iteration is locked to a single type so every
-        # checked type gets dedicated commit slots in proportion to how many
-        # types are enabled.
-        type_cursor = 0
         save_at = set(p.save_at)
         # Tell the GUI which backend actually ran (status bar). `self._backend`
         # is the resolved/effective backend after any GPU build attempt.
@@ -488,14 +513,11 @@ class Engine:
                 while self._pause and not self._stop:
                     time.sleep(0.05)
 
-                iter_types = [types[type_cursor % len(types)]]
-                type_cursor += 1
-
                 progress = len(self.shapes) / max(1, p.stop_at)
                 size_cap = self._max_size_frac_for_progress(progress)
 
                 refined_score, refined = self._search(
-                    iter_types, max(1, p.random_samples), max(1, p.mutated_samples),
+                    types, max(1, p.random_samples), max(1, p.mutated_samples),
                     max_size_frac=size_cap,
                 )
                 # If the GPU degraded to CPU mid-run, announce the new backend once.
@@ -515,7 +537,7 @@ class Engine:
                         if refined is not None and refined_score != float("inf"):
                             break
                         refined_score, refined = self._search(
-                            iter_types, max(1, p.random_samples), max(1, p.mutated_samples),
+                            types, max(1, p.random_samples), max(1, p.mutated_samples),
                             max_size_frac=size_cap,
                         )
                         sticker_attempts += 1
@@ -556,6 +578,10 @@ class Engine:
                 if self.RESIDUAL_REFRESH_EVERY > 0 and count > 0 and count % self.RESIDUAL_REFRESH_EVERY == 0:
                     self._refresh_residual_weight()
 
+                # Periodic global refinement
+                if getattr(p, "global_refinement", False) and count > 0 and count % 50 == 0:
+                    self._global_refinement_pass()
+
                 yield EngineEvent(kind="shape_committed", shape_count=count, rms=self.rms)
 
                 if p.preview_every and (count % p.preview_every == 0):
@@ -572,6 +598,93 @@ class Engine:
             yield EngineEvent(kind="error", message=f"{type(exc).__name__}: {exc}")
         finally:
             self._shutdown()
+
+
+    def _global_refinement_pass(self) -> None:
+        """Re-optimize the most recently added shapes by un-blending them."""
+        if len(self.shapes) < 2:
+            return
+
+        n_shapes = len(self.shapes)
+        tail_len = min(n_shapes, 5)
+        start_idx = n_shapes - tail_len
+
+        from fd6.shapegen.scoring import composite, score_shape
+        import numpy as np
+
+        # We work backwards from the current canvas
+        current_canvas = self.canvas.copy()
+
+        # We will un-blend shapes one by one from the back, refine them, and build a new tail
+        # To avoid complex Z-order math, we just unblend the last 5 shapes exactly.
+        # Since they are at the top of the Z-order, un-blending the last shape gives the canvas before it.
+
+        # First, collect the base canvases for each shape in the tail by unblending backwards
+        canvases = []
+        for idx in range(n_shapes - 1, start_idx - 1, -1):
+            shape = self.shapes[idx]
+            bbox = shape.bbox(self.w, self.h)
+            x0, y0, x1, y1 = bbox
+
+            if x1 > x0 and y1 > y0:
+                mask_local, bbox2 = shape.rasterize_mask(self.w, self.h)
+                if bbox2 == bbox and mask_local.size > 0:
+                    region_cur = current_canvas[y0:y1, x0:x1].astype(np.float32)
+                    alpha_val = shape.color[3] / 255.0
+                    m = mask_local.astype(np.float32) / 255.0
+                    if self.alpha_mask is not None:
+                        alpha_t = self.alpha_mask[y0:y1, x0:x1].astype(np.float32) / 255.0
+                        m = m * alpha_t
+                    m3 = m[:, :, None]
+                    color_arr = np.array(shape.color[:3], dtype=np.float32)
+
+                    a_eff = m3 * alpha_val
+                    denom = np.maximum(1.0 - a_eff, 0.01)
+                    region_bg = (region_cur - a_eff * color_arr) / denom
+
+                    current_canvas[y0:y1, x0:x1] = np.clip(region_bg, 0, 255).astype(np.uint8)
+
+            # current_canvas is now the canvas BEFORE this shape was drawn
+            canvases.append(current_canvas.copy())
+
+        # canvases contains canvases in reverse order: [before_last, before_second_to_last, ..., before_first_in_tail]
+        canvases.reverse()
+
+        # Now we refine them forwards
+        base_canvas = canvases[0]
+
+        for i, idx in enumerate(range(start_idx, n_shapes)):
+            if self._stop or self._pause:
+                break
+
+            original_shape = self.shapes[idx]
+            best_shape = original_shape
+            best_score, best_color = score_shape(original_shape, base_canvas, self.target, self.alpha_mask, edge_weight=self.edge_weight)
+            best_shape.color = best_color
+
+            cap = max(1, self.profile.mutated_samples // 4)
+            no_improve = 0
+            for _ in range(cap):
+                cand = best_shape.mutate(self.rng, self.w, self.h)
+                score, color = score_shape(cand, base_canvas, self.target, self.alpha_mask, edge_weight=self.edge_weight)
+                if score < best_score:
+                    best_score, best_color, best_shape = score, color, cand
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    if no_improve >= max(2, cap // 4):
+                        break
+
+            if best_shape is not original_shape:
+                best_shape.color = best_color
+                self.shapes[idx] = best_shape
+
+            base_canvas, _ = composite(base_canvas, best_shape, self.target, self.alpha_mask, edge_weight=self.edge_weight)
+
+        self.canvas[:] = base_canvas
+        from fd6.shapegen.scoring import rms_error
+        self.rms = rms_error(self.canvas, self.target, self.alpha_mask)
+
 
     def _shutdown(self) -> None:
         try:

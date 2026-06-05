@@ -78,8 +78,9 @@ class Triangle(Shape):
         )
 
     @classmethod
-    def random(cls, rng: random.Random, w: int, h: int, max_size_frac: float | None = None) -> "Triangle":
-        cx, cy = rng.uniform(0, w - 1), rng.uniform(0, h - 1)
+    def random(cls, rng: random.Random, w: int, h: int, max_size_frac: float | None = None, cx: float | None = None, cy: float | None = None) -> "Triangle":
+        cx = cx if cx is not None else rng.uniform(0, w - 1)
+        cy = cy if cy is not None else rng.uniform(0, h - 1)
         if max_size_frac is None:
             spread = max(4.0, min(w, h) / 8.0)
         else:
