@@ -51,11 +51,18 @@ class DifferentiableRasterizer(nn.Module):
         d_ellipse = (torch.sqrt(ellipse_dist + 1e-8) - 1.0) * torch.min(rx, ry)
         shape_alpha = torch.sigmoid(-d_ellipse * self.sharpness) * alphas
 
-        canvas = base_canvas_tensor.clone()
-        for i in range(N):
-            a_i = shape_alpha[i].unsqueeze(0)
-            c_i = colors[i].view(3, 1, 1)
-            canvas = c_i * a_i + canvas * (1.0 - a_i)
+        # If we just want to render each shape independently, we expand the canvas
+        # and do batch operations to save memory and time
+        # shape_alpha is [N, H, W]
+        # colors is [N, 3] -> [N, 3, 1, 1]
+        a_i = shape_alpha.unsqueeze(1) # [N, 1, H, W]
+        c_i = colors.view(N, 3, 1, 1)
+
+        # We assume base_canvas_tensor is [3, H, W]
+        # Expand it to [N, 3, H, W]
+        canvas = base_canvas_tensor.unsqueeze(0).expand(N, -1, -1, -1)
+
+        canvas = c_i * a_i + canvas * (1.0 - a_i)
 
         return canvas
 
@@ -119,37 +126,58 @@ class PyTorchSearcher:
 
         optimizer = torch.optim.Adam([params], lr=0.1)
 
+        target_masked = self.target_tensor * self.alpha_mask_tensor
+
+        # Limit batch size to avoid OOM
+        max_batch = 32
+
+        # We will split into chunks
+        num_chunks = (batch_size + max_batch - 1) // max_batch
+
+        # 1. First pass without gradients to find the top candidates (reduces work)
+        with torch.no_grad():
+            scores = []
+            for i in range(num_chunks):
+                start = i * max_batch
+                end = min((i + 1) * max_batch, batch_size)
+                p_chunk = params[start:end]
+
+                rendered = self.renderer(p_chunk, canvas_tensor) # [B, 3, H, W]
+                rendered_masked = rendered * self.alpha_mask_tensor.unsqueeze(0) # [B, 3, H, W]
+                # target_masked is [3, H, W], broadcast to [B, 3, H, W]
+
+                diff = (rendered_masked - target_masked.unsqueeze(0))**2 # [B, 3, H, W]
+                loss = (diff.sum(dim=1) * self.edge_weight_tensor.unsqueeze(0)).mean(dim=(1, 2)) # [B]
+                scores.append(loss)
+
+            all_scores = torch.cat(scores)
+
+        # 2. Select top K for gradient descent
+        top_k = min(16, batch_size)
+        _, top_indices = torch.topk(all_scores, top_k, largest=False)
+
+        top_params = params[top_indices].clone().detach().requires_grad_(True)
+
+        optimizer = torch.optim.Adam([top_params], lr=0.1)
+
         # Optimize for 15 steps
         for step in range(15):
             optimizer.zero_grad()
 
-            # We want to render each shape INDEPENDENTLY over the base canvas
-            # to see which single shape is best.
-            # DifferentiableRasterizer forward currently composites ALL shapes in the batch.
-            # Let's adjust logic: we want the best single shape. We'll score them all later via CPU score_shape.
-            # For the gradient, let's just optimize them as if they are a sequence, or independent?
-            # If we optimize them independently, we need to loop or batch differently.
-            # Let's just do a simple loop over batch for loss (not extremely efficient but functional for PoC).
+            rendered = self.renderer(top_params, canvas_tensor) # [K, 3, H, W]
+            rendered_masked = rendered * self.alpha_mask_tensor.unsqueeze(0)
 
-            total_loss = 0
-            for i in range(batch_size):
-                rendered = self.renderer(params[i:i+1], canvas_tensor)
-                # Apply alpha mask if sticker mode
-                rendered_masked = rendered * self.alpha_mask_tensor
-                target_masked = self.target_tensor * self.alpha_mask_tensor
+            diff = (rendered_masked - target_masked.unsqueeze(0))**2
+            loss_per_shape = (diff.sum(dim=1) * self.edge_weight_tensor.unsqueeze(0)).mean(dim=(1, 2))
 
-                # Edge weighted MSE
-                diff = (rendered_masked - target_masked)**2
-                loss = (diff.sum(dim=0) * self.edge_weight_tensor).mean()
-                total_loss += loss
-
+            total_loss = loss_per_shape.sum()
             total_loss.backward()
             optimizer.step()
 
-        # After optimization, evaluate all shapes on CPU to find the best one
+        # After optimization, evaluate only the top_k shapes on CPU to find the best one
         # using the exact same scoring logic as OpenCL/CPU paths.
         with torch.no_grad():
-            final_params = params.detach()
+            final_params = top_params.detach()
             cx = torch.sigmoid(final_params[:, 0]).cpu().numpy() * self.w
             cy = torch.sigmoid(final_params[:, 1]).cpu().numpy() * self.h
             rx = (torch.sigmoid(final_params[:, 2]) * 0.5 + 1e-4).cpu().numpy() * self.w
@@ -159,7 +187,7 @@ class PyTorchSearcher:
         best_score = float('inf')
         best_shape = None
 
-        for i in range(batch_size):
+        for i in range(top_k):
             shape = RotatedEllipse(
                 x=float(cx[i]), y=float(cy[i]),
                 rx=float(rx[i]), ry=float(ry[i]),
