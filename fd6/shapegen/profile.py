@@ -94,7 +94,7 @@ def load_profile(name: str, text: str) -> Profile:
     if "shapeTypes" in section:
         p.shape_types = _parse_str_list(section["shapeTypes"])
     backend = getstr("computeBackend", p.compute_backend).lower().strip()
-    p.compute_backend = backend if backend in ("auto", "cpu", "gpu") else "auto"
+    p.compute_backend = backend if backend in ("auto", "cpu", "gpu", "pytorch") else "auto"
     return p
 
 

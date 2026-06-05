@@ -25,6 +25,7 @@ COMPUTE_BACKEND_CHOICES = [
     ("auto", "Auto (GPU if ready)"),
     ("cpu", "CPU"),
     ("gpu", "GPU (OpenCL — NVIDIA / AMD / Intel)"),
+    ("pytorch", "PyTorch (Experimental Differentiable Rendering)"),
 ]
 
 

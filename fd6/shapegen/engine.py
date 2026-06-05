@@ -304,6 +304,7 @@ class Engine:
         # searcher degrades to CPU. `self._backend` is the *effective* backend.
         from fd6.shapegen import gpu as _gpu
         self._gpu = None
+        self._pytorch = None
         self._backend = "cpu"
         self._gpu_fallback_reason = ""
         self._backend_announced = "cpu"
@@ -316,6 +317,15 @@ class Engine:
             except Exception:
                 self._gpu = None
                 self._backend = "cpu"
+        elif requested == "pytorch":
+            try:
+                from fd6.shapegen.pytorch_poc import PyTorchSearcher
+                self._pytorch = PyTorchSearcher(self.target, self.alpha_mask, self.edge_weight)
+                self._backend = "pytorch"
+            except Exception as e:
+                self._pytorch = None
+                self._backend = "cpu"
+                self._gpu_fallback_reason = f"PyTorch init failed: {e}"
 
     def _ensure_executor(self) -> None:
         """Create the CPU worker pool on first use (CPU runs and GPU fallback)."""
@@ -459,6 +469,13 @@ class Engine:
                 self._backend = "cpu"
                 self._gpu = None
                 self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
+        elif self._backend == "pytorch" and self._pytorch is not None:
+            try:
+                return self._pytorch.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
+            except Exception as exc:
+                self._backend = "cpu"
+                self._pytorch = None
+                self._gpu_fallback_reason = f"PyTorch search failed: {type(exc).__name__}: {exc}"
         return self._parallel_search(types, n_random, n_mutate, max_size_frac)
 
     def run(self) -> Iterable[EngineEvent]:

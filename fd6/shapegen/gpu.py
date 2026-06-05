@@ -184,15 +184,18 @@ def list_gpu_names() -> list[str]:
 
 
 def resolve_backend(requested: str) -> str:
-    """Map a profile's compute_backend ('auto'|'cpu'|'gpu') to 'cpu' or 'gpu'.
+    """Map a profile's compute_backend ('auto'|'cpu'|'gpu'|'pytorch') to effective backend.
 
     'auto' -> 'gpu' when an OpenCL GPU is available else 'cpu'. 'gpu' -> 'gpu'
     only when actually available (otherwise 'cpu', so a saved profile can't
     wedge the app on a machine without a GPU). 'cpu' is always honored.
+    'pytorch' is passed through verbatim so engine can handle it.
     """
     req = (requested or "auto").lower().strip()
     if req == "cpu":
         return "cpu"
+    if req == "pytorch":
+        return "pytorch"
     if req == "gpu":
         # Explicit GPU request → use the bundled pyopencl if present, else try a
         # one-time on-demand install as a fallback (source/dev runs).
@@ -206,6 +209,8 @@ def resolve_backend(requested: str) -> str:
 
 
 def backend_label(backend: str) -> str:
+    if backend == "pytorch":
+        return "GPU (PyTorch DR)"
     if backend != "gpu":
         return "CPU"
     names = list_gpu_names()
