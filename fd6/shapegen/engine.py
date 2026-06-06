@@ -123,6 +123,25 @@ _W_CANVAS_SHM: shared_memory.SharedMemory | None = None
 _W_CANVAS: np.ndarray | None = None
 
 
+def _cleanup_worker_shm() -> None:
+    """Explicitly close and unregister shared memory in worker processes to avoid segfaults."""
+    global _W_EDGE_SHM, _W_CANVAS_SHM
+    from multiprocessing.resource_tracker import unregister
+
+    if _W_EDGE_SHM is not None:
+        try:
+            _W_EDGE_SHM.close()
+            unregister(_W_EDGE_SHM._name, "shared_memory")
+        except Exception:
+            pass
+    if _W_CANVAS_SHM is not None:
+        try:
+            _W_CANVAS_SHM.close()
+            unregister(_W_CANVAS_SHM._name, "shared_memory")
+        except Exception:
+            pass
+
+
 def _init_worker(
     target_bytes: bytes, target_shape: tuple,
     canvas_shm_name: str, canvas_shape: tuple,
@@ -131,6 +150,8 @@ def _init_worker(
 ) -> None:
     """Subprocess startup hook. Wires up shared canvas + immutable target/alpha + LIVE edge weight."""
     global _W_TARGET, _W_ALPHA, _W_EDGE_WEIGHT, _W_EDGE_SHM, _W_CANVAS_SHM, _W_CANVAS
+    import atexit
+
     _W_TARGET = np.frombuffer(target_bytes, dtype=np.uint8).reshape(target_shape).copy()
     if alpha_bytes is not None and alpha_shape is not None:
         _W_ALPHA = np.frombuffer(alpha_bytes, dtype=np.uint8).reshape(alpha_shape).copy()
@@ -147,6 +168,8 @@ def _init_worker(
         _W_EDGE_WEIGHT = None
     _W_CANVAS_SHM = shared_memory.SharedMemory(name=canvas_shm_name)
     _W_CANVAS = np.ndarray(canvas_shape, dtype=np.uint8, buffer=_W_CANVAS_SHM.buf)
+
+    atexit.register(_cleanup_worker_shm)
 
 
 def _worker_independent_search(args: tuple) -> tuple:

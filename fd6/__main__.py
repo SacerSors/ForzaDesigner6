@@ -15,6 +15,10 @@ if __name__ == "__main__":
     if sys.platform.startswith("linux"):
         try:
             import torch  # noqa: F401
+            # Force Triton and ROCm initialization synchronously to prevent
+            # background threads colliding with PySide6 later
+            if torch.cuda.is_available():
+                torch.cuda.init()
             try:
                 multiprocessing.set_start_method("spawn")
             except RuntimeError:
