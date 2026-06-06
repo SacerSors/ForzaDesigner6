@@ -34,12 +34,14 @@ class PyTorchDiffRenderer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.h, self.w = target.shape[:2]
-        self.target = torch.from_numpy(target).float().to(self.device) / 255.0
-        self.edge_weight = torch.from_numpy(edge_weight).float().to(self.device)
+        # Use np.array(copy=True) to avoid PyTorch warnings and potential segfaults
+        # when converting read-only shared_memory buffers to tensors.
+        self.target = torch.from_numpy(np.array(target, copy=True)).float().to(self.device) / 255.0
+        self.edge_weight = torch.from_numpy(np.array(edge_weight, copy=True)).float().to(self.device)
         self.n_weight = float(self.edge_weight.sum().item()) * 3.0
 
         if alpha_mask is not None:
-            self.alpha_mask = torch.from_numpy(alpha_mask).float().to(self.device) / 255.0
+            self.alpha_mask = torch.from_numpy(np.array(alpha_mask, copy=True)).float().to(self.device) / 255.0
         else:
             self.alpha_mask = torch.ones((self.h, self.w), dtype=torch.float32, device=self.device)
 
@@ -271,7 +273,7 @@ class PyTorchDiffRenderer:
         if hasattr(self, '_current_type'):
             shape_type = self._current_type
 
-        cur_tensor = torch.from_numpy(canvas).float().to(self.device) / 255.0
+        cur_tensor = torch.from_numpy(np.array(canvas, copy=True)).float().to(self.device) / 255.0
 
         full_sq = (((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)).sum()
 
@@ -306,9 +308,9 @@ class PyTorchDiffRenderer:
 
         top_params = params[top_indices].clone().detach().requires_grad_(True)
 
-        # 3. Optimize top K candidates via Gradient Descent
-        # Setting foreach=False to avoid aten::lerp fallback issues
-        optimizer = torch.optim.Adam([top_params], lr=1.0, foreach=False)
+        # 3. Optimize top K candidates via Manual Gradient Descent
+        # We manually update weights to avoid torch.optim.Adam segfaulting
+        # on ROCm inside a background QThread.
 
         best_idx = 0
         best_opt_score = best_score
@@ -316,9 +318,12 @@ class PyTorchDiffRenderer:
         best_opt_color = all_colors[top_indices[0]].detach().clone()
 
         n_mutate = max(1, n_mutate)
+        lr = 1.0
 
         for _ in range(n_mutate):
-            optimizer.zero_grad()
+            if top_params.grad is not None:
+                top_params.grad.zero_()
+
             mask = self._get_mask(shape_type, top_params)
             sc, col = self._score_and_color(cur_tensor, mask, full_sq)
 
@@ -328,7 +333,10 @@ class PyTorchDiffRenderer:
                 break
 
             loss.backward()
-            optimizer.step()
+
+            # Manual SGD step
+            with torch.no_grad():
+                top_params -= lr * top_params.grad
 
             # Check if any score improved
             with torch.no_grad():
