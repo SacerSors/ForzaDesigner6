@@ -5,3 +5,4 @@ pytest>=8.0.0
 pyinstaller>=6.5.0
 torch>=2.0.0
 matplotlib>=3.0.0
+torch-directml>=0.2.0

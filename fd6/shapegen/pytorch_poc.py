@@ -119,7 +119,17 @@ class PyTorchSearcher:
     """Experimental Differentiable Rendering backend for Forza Designer 6."""
 
     def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cpu")
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            try:
+                import torch_directml
+                if torch_directml.is_available():
+                    self.device = torch_directml.device()
+            except (ImportError, OSError):
+                pass
+
         self.h, self.w = target.shape[:2]
 
         self.target_np = target
