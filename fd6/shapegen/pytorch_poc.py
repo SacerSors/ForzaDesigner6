@@ -184,34 +184,36 @@ class PyTorchSearcher:
         elif shape_type == "triangle":
             num_params = 10
 
-        params = torch.randn((batch_size, num_params), device=self.device) * 0.1
+        # Initialize randomly on CPU first (DirectML often lacks native RNG implementations)
+        cpu_dev = torch.device('cpu')
+        params_cpu = torch.randn((batch_size, num_params), device=cpu_dev) * 0.1
         max_s = max_size_frac if max_size_frac else 0.5
 
         if shape_type in ("rotated_ellipse", "rotated_rectangle"):
-            params[:, 0:2] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device))
-            params[:, 2:4] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device) * max_s + 0.01)
-            params[:, 4] = torch.rand((batch_size,), device=self.device) * 3.14159 * 2.0
-            params[:, 5:8] = inv_sigmoid(torch.rand((batch_size, 3), device=self.device))
-            params[:, 8] = inv_sigmoid(torch.ones((batch_size,), device=self.device) * 0.5)
+            params_cpu[:, 0:2] = inv_sigmoid(torch.rand((batch_size, 2), device=cpu_dev))
+            params_cpu[:, 2:4] = inv_sigmoid(torch.rand((batch_size, 2), device=cpu_dev) * max_s + 0.01)
+            params_cpu[:, 4] = torch.rand((batch_size,), device=cpu_dev) * 3.14159 * 2.0
+            params_cpu[:, 5:8] = inv_sigmoid(torch.rand((batch_size, 3), device=cpu_dev))
+            params_cpu[:, 8] = inv_sigmoid(torch.ones((batch_size,), device=cpu_dev) * 0.5)
         elif shape_type == "rectangle":
-            params[:, 0:2] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device))
-            params[:, 2:4] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device) * max_s + 0.01)
-            params[:, 4:7] = inv_sigmoid(torch.rand((batch_size, 3), device=self.device))
-            params[:, 7] = inv_sigmoid(torch.ones((batch_size,), device=self.device) * 0.5)
+            params_cpu[:, 0:2] = inv_sigmoid(torch.rand((batch_size, 2), device=cpu_dev))
+            params_cpu[:, 2:4] = inv_sigmoid(torch.rand((batch_size, 2), device=cpu_dev) * max_s + 0.01)
+            params_cpu[:, 4:7] = inv_sigmoid(torch.rand((batch_size, 3), device=cpu_dev))
+            params_cpu[:, 7] = inv_sigmoid(torch.ones((batch_size,), device=cpu_dev) * 0.5)
         elif shape_type == "triangle":
-            params[:, 0:6] = inv_sigmoid(torch.rand((batch_size, 6), device=self.device))
+            params_cpu[:, 0:6] = inv_sigmoid(torch.rand((batch_size, 6), device=cpu_dev))
             # keep points somewhat grouped by modifying initialization to be around a center
-            cxcy = torch.rand((batch_size, 2), device=self.device)
+            cxcy = torch.rand((batch_size, 2), device=cpu_dev)
             spread = max_s * 0.5
             for v in range(3):
-                pts = cxcy + (torch.rand((batch_size, 2), device=self.device) - 0.5) * spread
+                pts = cxcy + (torch.rand((batch_size, 2), device=cpu_dev) - 0.5) * spread
                 pts = torch.clamp(pts, 0.01, 0.99)
-                params[:, v*2:v*2+2] = inv_sigmoid(pts)
+                params_cpu[:, v*2:v*2+2] = inv_sigmoid(pts)
 
-            params[:, 6:9] = inv_sigmoid(torch.rand((batch_size, 3), device=self.device))
-            params[:, 9] = inv_sigmoid(torch.ones((batch_size,), device=self.device) * 0.5)
+            params_cpu[:, 6:9] = inv_sigmoid(torch.rand((batch_size, 3), device=cpu_dev))
+            params_cpu[:, 9] = inv_sigmoid(torch.ones((batch_size,), device=cpu_dev) * 0.5)
 
-        params.requires_grad_(True)
+        params = params_cpu.to(self.device).requires_grad_(True)
 
         optimizer = torch.optim.Adam([params], lr=0.1, foreach=False)
 
@@ -243,7 +245,9 @@ class PyTorchSearcher:
 
         # 2. Select top K for gradient descent
         top_k = min(16, batch_size)
-        _, top_indices = torch.topk(all_scores, top_k, largest=False)
+        # DirectML does not implement topk for all data types. Using sort is safer.
+        _, sorted_indices = torch.sort(all_scores, descending=False)
+        top_indices = sorted_indices[:top_k]
 
         top_params = params[top_indices].clone().detach().requires_grad_(True)
 
