@@ -6,7 +6,13 @@ from pathlib import Path
 # on Linux/ROCm can cause fatal static TLS exhaustion and LLVM symbol collisions.
 try:
     import torch
-except ImportError:
+    if torch.cuda.is_available():
+        # Force CUDA/Triton to initialize entirely on the main thread now
+        # to prevent lazy-loading crashes later in worker threads.
+        torch.zeros(1).cuda()
+    # Eagerly import the module so its internal static dependencies load.
+    from fd6.shapegen import pytorch_poc
+except Exception:
     pass
 
 from PySide6.QtGui import QIcon
