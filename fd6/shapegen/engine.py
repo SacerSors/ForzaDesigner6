@@ -4,14 +4,23 @@ from dataclasses import dataclass
 from typing import Iterable
 import ctypes
 import os
+import logging
 import random
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 from multiprocessing import shared_memory
 
 import numpy as np
 from concurrent.futures.process import BrokenProcessPool
+
+try:
+    from fd6.shapegen.pytorch_backend import PyTorchDiffRenderer
+except ImportError:
+    PyTorchDiffRenderer = None
 
 from fd6.shapegen.profile import Profile
 from fd6.shapegen.scoring import (
@@ -333,17 +342,24 @@ class Engine:
         ellipse_only = all(t in ("rotated_ellipse", "ellipse") for t in (self.profile.shape_types or []))
 
         req_backend = getattr(self.profile, "compute_backend", "auto")
+        logger.warning(f"Engine init: resolved compute_backend requested from profile as '{req_backend}'")
         if req_backend == "pytorch":
             requested = "pytorch"
         else:
             requested = _gpu.resolve_backend(req_backend)
 
+        logger.warning(f"Engine init: finalized 'requested' backend is '{requested}'")
+
         if requested == "pytorch":
+            logger.warning("Engine init: attempting to instantiate PyTorchDiffRenderer...")
             try:
-                from fd6.shapegen.pytorch_backend import PyTorchDiffRenderer
+                if PyTorchDiffRenderer is None:
+                    raise ImportError("PyTorchDiffRenderer could not be imported earlier.")
                 self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight)
                 self._backend = "pytorch"
+                logger.warning("Engine init: PyTorchDiffRenderer instantiated successfully.")
             except Exception as exc:
+                logger.error(f"Engine init: PyTorch backend init failed: {type(exc).__name__}: {exc}", exc_info=True)
                 self._gpu = None
                 self._backend = "cpu"
                 self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
