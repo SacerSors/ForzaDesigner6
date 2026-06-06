@@ -471,7 +471,7 @@ class Engine:
                 self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
         elif self._backend == "pytorch" and self._pytorch is not None:
             try:
-                return self._pytorch.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
+                return self._pytorch.search(self.canvas, types, n_random, n_mutate, max_size_frac, self.rng)
             except Exception as exc:
                 self._backend = "cpu"
                 self._pytorch = None

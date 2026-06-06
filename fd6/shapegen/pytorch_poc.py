@@ -6,6 +6,9 @@ import torch.nn as nn
 from typing import Optional
 
 from fd6.shapegen.shapes.ellipse import RotatedEllipse
+from fd6.shapegen.shapes.rectangle import Rectangle, RotatedRectangle
+from fd6.shapegen.shapes.triangle import Triangle
+from fd6.shapegen.shapes.base import Shape
 from fd6.shapegen.scoring import score_shape
 
 class DifferentiableRasterizer(nn.Module):
@@ -23,33 +26,79 @@ class DifferentiableRasterizer(nn.Module):
         self.register_buffer('grid_x', x.unsqueeze(0))
         self.register_buffer('grid_y', y.unsqueeze(0))
 
-    def forward(self, params, base_canvas_tensor, edge_weight_tensor=None):
+    def forward(self, params, base_canvas_tensor, shape_type="rotated_ellipse", edge_weight_tensor=None):
         N = params.shape[0]
         device = params.device
 
-        cx = torch.sigmoid(params[:, 0]).view(N, 1, 1)
-        cy = torch.sigmoid(params[:, 1]).view(N, 1, 1)
-        rx = (torch.sigmoid(params[:, 2]) * 0.5 + 1e-4).view(N, 1, 1)
-        ry = (torch.sigmoid(params[:, 3]) * 0.5 + 1e-4).view(N, 1, 1)
+        if shape_type in ("rotated_ellipse", "rotated_rectangle"):
+            cx = torch.sigmoid(params[:, 0]).view(N, 1, 1)
+            cy = torch.sigmoid(params[:, 1]).view(N, 1, 1)
+            rx = (torch.sigmoid(params[:, 2]) * 0.5 + 1e-4).view(N, 1, 1)
+            ry = (torch.sigmoid(params[:, 3]) * 0.5 + 1e-4).view(N, 1, 1)
+            theta = params[:, 4].view(N, 1, 1)
+            colors = torch.sigmoid(params[:, 5:8])
+            alphas = torch.sigmoid(params[:, 8]).view(N, 1, 1)
 
-        theta = params[:, 4].view(N, 1, 1)
-        # We don't optimize color in the renderer for now, just the shape itself.
-        # But we need color for rendering to compute loss. Let's make it grayscale for shape matching if no target color,
-        # or we just let it optimize color too.
-        colors = torch.sigmoid(params[:, 5:8])
-        alphas = torch.sigmoid(params[:, 8]).view(N, 1, 1)
+            dx = self.grid_x - cx
+            dy = self.grid_y - cy
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+            x_loc = dx * cos_t + dy * sin_t
+            y_loc = -dx * sin_t + dy * cos_t
 
-        dx = self.grid_x - cx
-        dy = self.grid_y - cy
+            if shape_type == "rotated_ellipse":
+                ellipse_dist = (x_loc / rx)**2 + (y_loc / ry)**2
+                dist = (torch.sqrt(ellipse_dist + 1e-8) - 1.0) * torch.min(rx, ry)
+            else:
+                dist = torch.max(torch.abs(x_loc) - rx, torch.abs(y_loc) - ry)
 
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
-        x_loc = dx * cos_t + dy * sin_t
-        y_loc = -dx * sin_t + dy * cos_t
+            shape_alpha = torch.sigmoid(-dist * self.sharpness) * alphas
 
-        ellipse_dist = (x_loc / rx)**2 + (y_loc / ry)**2
-        d_ellipse = (torch.sqrt(ellipse_dist + 1e-8) - 1.0) * torch.min(rx, ry)
-        shape_alpha = torch.sigmoid(-d_ellipse * self.sharpness) * alphas
+        elif shape_type == "rectangle":
+            cx = torch.sigmoid(params[:, 0]).view(N, 1, 1)
+            cy = torch.sigmoid(params[:, 1]).view(N, 1, 1)
+            hw = (torch.sigmoid(params[:, 2]) * 0.5 + 1e-4).view(N, 1, 1)
+            hh = (torch.sigmoid(params[:, 3]) * 0.5 + 1e-4).view(N, 1, 1)
+            colors = torch.sigmoid(params[:, 4:7])
+            alphas = torch.sigmoid(params[:, 7]).view(N, 1, 1)
+
+            dx = self.grid_x - cx
+            dy = self.grid_y - cy
+            dist = torch.max(torch.abs(dx) - hw, torch.abs(dy) - hh)
+            shape_alpha = torch.sigmoid(-dist * self.sharpness) * alphas
+
+        elif shape_type == "triangle":
+            x1 = torch.sigmoid(params[:, 0]).view(N, 1, 1)
+            y1 = torch.sigmoid(params[:, 1]).view(N, 1, 1)
+            x2 = torch.sigmoid(params[:, 2]).view(N, 1, 1)
+            y2 = torch.sigmoid(params[:, 3]).view(N, 1, 1)
+            x3 = torch.sigmoid(params[:, 4]).view(N, 1, 1)
+            y3 = torch.sigmoid(params[:, 5]).view(N, 1, 1)
+            colors = torch.sigmoid(params[:, 6:9])
+            alphas = torch.sigmoid(params[:, 9]).view(N, 1, 1)
+
+            # Signed distance to edge
+            def edge_dist(px, py, ax, ay, bx, by):
+                return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+
+            d1 = edge_dist(self.grid_x, self.grid_y, x1, y1, x2, y2)
+            d2 = edge_dist(self.grid_x, self.grid_y, x2, y2, x3, y3)
+            d3 = edge_dist(self.grid_x, self.grid_y, x3, y3, x1, y1)
+
+            # Smooth step for the edges. In SDF, positive is outside, negative is inside.
+            # However, orientation matters for triangles.
+            # If d1, d2, d3 are all same sign, it's inside.
+            mask1_pos = torch.sigmoid(d1 * self.sharpness)
+            mask2_pos = torch.sigmoid(d2 * self.sharpness)
+            mask3_pos = torch.sigmoid(d3 * self.sharpness)
+            mask_all_pos = mask1_pos * mask2_pos * mask3_pos
+
+            mask1_neg = torch.sigmoid(-d1 * self.sharpness)
+            mask2_neg = torch.sigmoid(-d2 * self.sharpness)
+            mask3_neg = torch.sigmoid(-d3 * self.sharpness)
+            mask_all_neg = mask1_neg * mask2_neg * mask3_neg
+
+            shape_alpha = (mask_all_pos + mask_all_neg) * alphas
 
         # If we just want to render each shape independently, we expand the canvas
         # and do batch operations to save memory and time
@@ -94,8 +143,8 @@ class PyTorchSearcher:
 
         self.renderer = DifferentiableRasterizer(self.h, self.w, sharpness=40.0).to(self.device)
 
-    def search(self, canvas: np.ndarray, n_random: int, n_mutate: int,
-               max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[RotatedEllipse]]:
+    def search(self, canvas: np.ndarray, types: list[str], n_random: int, n_mutate: int,
+               max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
         """
         Differentiable rendering search. We optimize a batch of random shapes simultaneously,
         but each shape is optimized independently against the current canvas to see which ONE shape
@@ -107,20 +156,49 @@ class PyTorchSearcher:
 
         batch_size = max(1, n_random)
 
+        shape_type = types[0] if types else "rotated_ellipse"
+
         def inv_sigmoid(x):
             return torch.log(x / (1.0 - x + 1e-5))
 
-        # Initialize random params
-        params = torch.randn((batch_size, 9), device=self.device) * 0.1
-        params[:, 0:2] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device)) # Random positions
+        # Initialize random params.
+        # For rotated_ellipse: 9 params (cx, cy, rx, ry, theta, r, g, b, a)
+        # For rectangle: 8 params (cx, cy, hw, hh, r, g, b, a)
+        # For rotated_rectangle: 9 params (cx, cy, hw, hh, theta, r, g, b, a)
+        # For triangle: 10 params (x1, y1, x2, y2, x3, y3, r, g, b, a)
 
-        # Scale based on max_size_frac
+        num_params = 9
+        if shape_type == "rectangle":
+            num_params = 8
+        elif shape_type == "triangle":
+            num_params = 10
+
+        params = torch.randn((batch_size, num_params), device=self.device) * 0.1
         max_s = max_size_frac if max_size_frac else 0.5
-        params[:, 2:4] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device) * max_s + 0.01)
 
-        params[:, 4] = torch.rand((batch_size,), device=self.device) * 3.14159 * 2.0 # Rotation
-        params[:, 5:8] = inv_sigmoid(torch.rand((batch_size, 3), device=self.device)) # Random colors
-        params[:, 8] = inv_sigmoid(torch.ones((batch_size,), device=self.device) * 0.5) # Alpha ~0.5
+        if shape_type in ("rotated_ellipse", "rotated_rectangle"):
+            params[:, 0:2] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device))
+            params[:, 2:4] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device) * max_s + 0.01)
+            params[:, 4] = torch.rand((batch_size,), device=self.device) * 3.14159 * 2.0
+            params[:, 5:8] = inv_sigmoid(torch.rand((batch_size, 3), device=self.device))
+            params[:, 8] = inv_sigmoid(torch.ones((batch_size,), device=self.device) * 0.5)
+        elif shape_type == "rectangle":
+            params[:, 0:2] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device))
+            params[:, 2:4] = inv_sigmoid(torch.rand((batch_size, 2), device=self.device) * max_s + 0.01)
+            params[:, 4:7] = inv_sigmoid(torch.rand((batch_size, 3), device=self.device))
+            params[:, 7] = inv_sigmoid(torch.ones((batch_size,), device=self.device) * 0.5)
+        elif shape_type == "triangle":
+            params[:, 0:6] = inv_sigmoid(torch.rand((batch_size, 6), device=self.device))
+            # keep points somewhat grouped by modifying initialization to be around a center
+            cxcy = torch.rand((batch_size, 2), device=self.device)
+            spread = max_s * 0.5
+            for v in range(3):
+                pts = cxcy + (torch.rand((batch_size, 2), device=self.device) - 0.5) * spread
+                pts = torch.clamp(pts, 0.01, 0.99)
+                params[:, v*2:v*2+2] = inv_sigmoid(pts)
+
+            params[:, 6:9] = inv_sigmoid(torch.rand((batch_size, 3), device=self.device))
+            params[:, 9] = inv_sigmoid(torch.ones((batch_size,), device=self.device) * 0.5)
 
         params.requires_grad_(True)
 
@@ -142,7 +220,7 @@ class PyTorchSearcher:
                 end = min((i + 1) * max_batch, batch_size)
                 p_chunk = params[start:end]
 
-                rendered = self.renderer(p_chunk, canvas_tensor) # [B, 3, H, W]
+                rendered = self.renderer(p_chunk, canvas_tensor, shape_type) # [B, 3, H, W]
                 rendered_masked = rendered * self.alpha_mask_tensor.unsqueeze(0) # [B, 3, H, W]
                 # target_masked is [3, H, W], broadcast to [B, 3, H, W]
 
@@ -164,7 +242,7 @@ class PyTorchSearcher:
         for step in range(15):
             optimizer.zero_grad()
 
-            rendered = self.renderer(top_params, canvas_tensor) # [K, 3, H, W]
+            rendered = self.renderer(top_params, canvas_tensor, shape_type) # [K, 3, H, W]
             rendered_masked = rendered * self.alpha_mask_tensor.unsqueeze(0)
 
             diff = (rendered_masked - target_masked.unsqueeze(0))**2
@@ -178,22 +256,53 @@ class PyTorchSearcher:
         # using the exact same scoring logic as OpenCL/CPU paths.
         with torch.no_grad():
             final_params = top_params.detach()
-            cx = torch.sigmoid(final_params[:, 0]).cpu().numpy() * self.w
-            cy = torch.sigmoid(final_params[:, 1]).cpu().numpy() * self.h
-            rx = (torch.sigmoid(final_params[:, 2]) * 0.5 + 1e-4).cpu().numpy() * self.w
-            ry = (torch.sigmoid(final_params[:, 3]) * 0.5 + 1e-4).cpu().numpy() * self.h
-            theta = final_params[:, 4].cpu().numpy() * (180.0 / math.pi)
+
+            if shape_type in ("rotated_ellipse", "rotated_rectangle"):
+                cx = torch.sigmoid(final_params[:, 0]).cpu().numpy() * self.w
+                cy = torch.sigmoid(final_params[:, 1]).cpu().numpy() * self.h
+                rx = (torch.sigmoid(final_params[:, 2]) * 0.5 + 1e-4).cpu().numpy() * self.w
+                ry = (torch.sigmoid(final_params[:, 3]) * 0.5 + 1e-4).cpu().numpy() * self.h
+                theta = final_params[:, 4].cpu().numpy() * (180.0 / math.pi)
+            elif shape_type == "rectangle":
+                cx = torch.sigmoid(final_params[:, 0]).cpu().numpy() * self.w
+                cy = torch.sigmoid(final_params[:, 1]).cpu().numpy() * self.h
+                hw = (torch.sigmoid(final_params[:, 2]) * 0.5 + 1e-4).cpu().numpy() * self.w
+                hh = (torch.sigmoid(final_params[:, 3]) * 0.5 + 1e-4).cpu().numpy() * self.h
+            elif shape_type == "triangle":
+                x1 = torch.sigmoid(final_params[:, 0]).cpu().numpy() * self.w
+                y1 = torch.sigmoid(final_params[:, 1]).cpu().numpy() * self.h
+                x2 = torch.sigmoid(final_params[:, 2]).cpu().numpy() * self.w
+                y2 = torch.sigmoid(final_params[:, 3]).cpu().numpy() * self.h
+                x3 = torch.sigmoid(final_params[:, 4]).cpu().numpy() * self.w
+                y3 = torch.sigmoid(final_params[:, 5]).cpu().numpy() * self.h
 
         best_score = float('inf')
         best_shape = None
 
         for i in range(top_k):
-            shape = RotatedEllipse(
-                x=float(cx[i]), y=float(cy[i]),
-                rx=float(rx[i]), ry=float(ry[i]),
-                angle=float(theta[i]),
-                color=(0, 0, 0, 128) # Color will be optimized by CPU score_shape
-            )
+            if shape_type == "rotated_ellipse":
+                shape = RotatedEllipse(
+                    x=float(cx[i]), y=float(cy[i]),
+                    rx=float(rx[i]), ry=float(ry[i]),
+                    angle=float(theta[i]), color=(0, 0, 0, 128)
+                )
+            elif shape_type == "rectangle":
+                shape = Rectangle(
+                    x=float(cx[i]), y=float(cy[i]),
+                    hw=float(hw[i]), hh=float(hh[i]), color=(0, 0, 0, 128)
+                )
+            elif shape_type == "rotated_rectangle":
+                shape = RotatedRectangle(
+                    x=float(cx[i]), y=float(cy[i]),
+                    hw=float(rx[i]), hh=float(ry[i]),
+                    angle=float(theta[i]), color=(0, 0, 0, 128)
+                )
+            elif shape_type == "triangle":
+                shape = Triangle(
+                    x1=float(x1[i]), y1=float(y1[i]),
+                    x2=float(x2[i]), y2=float(y2[i]),
+                    x3=float(x3[i]), y3=float(y3[i]), color=(0, 0, 0, 128)
+                )
 
             score, color = score_shape(
                 shape, canvas, self.target_np, self.alpha_mask_np,
