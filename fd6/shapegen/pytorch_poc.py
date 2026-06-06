@@ -5,6 +5,12 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
+try:
+    import torch_directml
+    HAS_DIRECTML = True
+except (ImportError, OSError):
+    HAS_DIRECTML = False
+
 from fd6.shapegen.shapes.ellipse import RotatedEllipse
 from fd6.shapegen.shapes.rectangle import Rectangle, RotatedRectangle
 from fd6.shapegen.shapes.triangle import Triangle
@@ -122,13 +128,8 @@ class PyTorchSearcher:
         self.device = torch.device("cpu")
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
-        else:
-            try:
-                import torch_directml
-                if torch_directml.is_available():
-                    self.device = torch_directml.device()
-            except (ImportError, OSError):
-                pass
+        elif HAS_DIRECTML and torch_directml.is_available():
+            self.device = torch_directml.device()
 
         self.h, self.w = target.shape[:2]
 
