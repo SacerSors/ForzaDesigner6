@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
+import atexit
 import ctypes
 import os
 import random
@@ -147,6 +148,14 @@ def _init_worker(
         _W_EDGE_WEIGHT = None
     _W_CANVAS_SHM = shared_memory.SharedMemory(name=canvas_shm_name)
     _W_CANVAS = np.ndarray(canvas_shape, dtype=np.uint8, buffer=_W_CANVAS_SHM.buf)
+
+    def _cleanup_shm():
+        if _W_CANVAS_SHM is not None:
+            _W_CANVAS_SHM.close()
+        if _W_EDGE_SHM is not None:
+            _W_EDGE_SHM.close()
+
+    atexit.register(_cleanup_shm)
 
 
 def _worker_independent_search(args: tuple) -> tuple:
