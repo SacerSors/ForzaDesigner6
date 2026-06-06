@@ -213,7 +213,7 @@ class PyTorchSearcher:
 
         params.requires_grad_(True)
 
-        optimizer = torch.optim.Adam([params], lr=0.1)
+        optimizer = torch.optim.Adam([params], lr=0.1, foreach=False)
 
         target_masked = self.target_tensor * self.alpha_mask_tensor
 
@@ -247,7 +247,7 @@ class PyTorchSearcher:
 
         top_params = params[top_indices].clone().detach().requires_grad_(True)
 
-        optimizer = torch.optim.Adam([top_params], lr=0.1)
+        optimizer = torch.optim.Adam([top_params], lr=0.1, foreach=False)
 
         # Optimize for 15 steps
         for step in range(15):
