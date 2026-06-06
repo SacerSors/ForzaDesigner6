@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QHBoxLayout, QMainWindow, QMessageBox, QSplitter, QStackedWidget, QStatusBar, QVBoxLayout, QWidget
@@ -683,13 +683,19 @@ class MainWindow(QMainWindow):
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self.preview.on_progress)
         self._worker.preview.connect(self.preview.on_preview)
-        self._worker.checkpoint_written.connect(lambda p: self.statusBar().showMessage(f"Checkpoint: {p}", 4000))
-        self._worker.backend_ready.connect(lambda label: self.statusBar().showMessage(f"Compute: {label}", 8000))
+        self._worker.checkpoint_written.connect(self._on_checkpoint_written)
+        self._worker.backend_ready.connect(self._on_backend_ready)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._thread.start()
         self.settings_panel.set_running(True)
         self.statusBar().showMessage(f"Generating: {next_path.name}")
+
+    def _on_checkpoint_written(self, p: str) -> None:
+        self.statusBar().showMessage(f"Checkpoint: {p}", 4000)
+
+    def _on_backend_ready(self, label: str) -> None:
+        self.statusBar().showMessage(f"Compute: {label}", 8000)
 
     def _on_finished(self, out_path: str) -> None:
         if self._current_path:
