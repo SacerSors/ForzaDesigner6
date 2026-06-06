@@ -308,8 +308,23 @@ class Engine:
         self._gpu_fallback_reason = ""
         self._backend_announced = "cpu"
         ellipse_only = all(t in ("rotated_ellipse", "ellipse") for t in (self.profile.shape_types or []))
-        requested = _gpu.resolve_backend(getattr(self.profile, "compute_backend", "auto"))
-        if requested == "gpu" and ellipse_only:
+
+        req_backend = getattr(self.profile, "compute_backend", "auto")
+        if req_backend == "pytorch":
+            requested = "pytorch"
+        else:
+            requested = _gpu.resolve_backend(req_backend)
+
+        if requested == "pytorch":
+            try:
+                from fd6.shapegen.pytorch_backend import PyTorchDiffRenderer
+                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight)
+                self._backend = "pytorch"
+            except Exception as exc:
+                self._gpu = None
+                self._backend = "cpu"
+                self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
+        elif requested == "gpu" and ellipse_only:
             try:
                 self._gpu = _gpu.OpenCLEllipseSearcher(self.target, self.alpha_mask, self.edge_weight)
                 self._backend = "gpu"
@@ -451,7 +466,16 @@ class Engine:
         runtime, we permanently fall back to the CPU pool for the rest of the run
         and record it so `run()` can tell the user via a backend event.
         """
-        if self._backend == "gpu" and self._gpu is not None:
+        if self._backend == "pytorch" and self._gpu is not None:
+            try:
+                # PyTorch backend needs to know which type to search for
+                self._gpu._current_type = self.profile.shape_types[0] if self.profile.shape_types else "rotated_ellipse"
+                return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
+            except Exception as exc:
+                self._backend = "cpu"
+                self._gpu = None
+                self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
+        elif self._backend == "gpu" and self._gpu is not None:
             try:
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
             except Exception as exc:

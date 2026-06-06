@@ -25,6 +25,7 @@ COMPUTE_BACKEND_CHOICES = [
     ("auto", "Auto (GPU if ready)"),
     ("cpu", "CPU"),
     ("gpu", "GPU (OpenCL — NVIDIA / AMD / Intel)"),
+    ("pytorch", "GPU (PyTorch/ROCm - Linux AMD)"),
 ]
 
 
@@ -174,8 +175,9 @@ class SettingsPanel(QWidget):
         layout.addWidget(sticker_group)
 
         # Shape types. Only rotated_ellipse is confirmed-working for the current
-        # FH6 build; remaining primitives are disabled pending further work.
-        supported_codes = {"rotated_ellipse"}
+        # FH6 build; remaining primitives are disabled pending further work, except
+        # when using the PyTorch backend which supports more shapes.
+        supported_codes = {"rotated_ellipse", "rectangle", "rotated_rectangle", "ellipse", "circle", "triangle"}
         supported_tooltips = {
             "rotated_ellipse": (
                 "An oval that can be rotated to any angle. Fits organic / "
