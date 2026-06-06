@@ -170,7 +170,8 @@ class PyTorchSearcher:
         shape_type = types[0] if types else "rotated_ellipse"
 
         def inv_sigmoid(x):
-            return torch.log(x / (1.0 - x + 1e-5))
+            x = torch.clamp(x, 1e-5, 1.0 - 1e-5)
+            return torch.log(x / (1.0 - x))
 
         # Initialize random params.
         # For rotated_ellipse: 9 params (cx, cy, rx, ry, theta, r, g, b, a)

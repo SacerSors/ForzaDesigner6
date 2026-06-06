@@ -9,7 +9,7 @@ import random
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import shared_memory
+from multiprocessing import shared_memory, resource_tracker
 
 import numpy as np
 from concurrent.futures.process import BrokenProcessPool
@@ -143,11 +143,13 @@ def _init_worker(
         # needing per-iteration IPC.
         _W_EDGE_SHM = shared_memory.SharedMemory(name=edge_shm_name)
         _W_EDGE_WEIGHT = np.ndarray(edge_shape, dtype=np.float32, buffer=_W_EDGE_SHM.buf)
+        resource_tracker.unregister(_W_EDGE_SHM._name, 'shared_memory')
     else:
         _W_EDGE_SHM = None
         _W_EDGE_WEIGHT = None
     _W_CANVAS_SHM = shared_memory.SharedMemory(name=canvas_shm_name)
     _W_CANVAS = np.ndarray(canvas_shape, dtype=np.uint8, buffer=_W_CANVAS_SHM.buf)
+    resource_tracker.unregister(_W_CANVAS_SHM._name, 'shared_memory')
 
     def _cleanup_shm():
         if _W_CANVAS_SHM is not None:

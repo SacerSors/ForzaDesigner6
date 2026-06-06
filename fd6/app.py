@@ -1,5 +1,14 @@
 import sys
 from pathlib import Path
+
+# IMPORTANT: Load PyTorch BEFORE Qt/Mesa on the main thread.
+# Lazy-loading heavy PyTorch modules (like libtriton) from a worker/GUI thread
+# on Linux/ROCm can cause fatal static TLS exhaustion and LLVM symbol collisions.
+try:
+    import torch
+except ImportError:
+    pass
+
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 from fd6.gui.main_window import MainWindow
