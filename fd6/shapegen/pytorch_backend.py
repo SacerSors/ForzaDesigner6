@@ -384,7 +384,6 @@ class PyTorchDiffRenderer:
         full_sq = (((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)).sum()
 
         n_random = max(1, n_random)
-        chunk_size = 128
 
         # We will track the best shapes across all evaluated types
         overall_best_score = float('inf')
@@ -407,6 +406,18 @@ class PyTorchDiffRenderer:
 
         for shape_type in types:
             params = self._random_params(shape_type, samples_per_type, self.w, self.h, max_size_frac, rng)
+
+            # Calculate optimal tile size T for this entire type batch
+            max_r = torch.max(torch.maximum(params[:, 2], params[:, 3])).item() if samples_per_type else 1.0
+            T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(max_r) + 2)))
+
+            # Dynamic Chunk Sizing: Cap the forward pass at ~256MB of VRAM to prevent
+            # PyTorch from starving the OS composer, while allowing tiny shapes
+            # to evaluate 10,000+ candidates simultaneously for extreme speed.
+            # T*T pixels * 3 channels * 4 bytes per float32
+            bytes_per_tile = T * T * 3 * 4
+            chunk_size = max(2, int((256 * 1024 * 1024) / max(1, bytes_per_tile)))
+            chunk_size = min(chunk_size, samples_per_type)
 
             scores_list = []
             colors_list = []
