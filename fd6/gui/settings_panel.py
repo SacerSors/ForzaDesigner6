@@ -99,6 +99,12 @@ class SettingsPanel(QWidget):
             "larger than your template's layer count, the injection will fail "
             "because there aren't enough slots."
         )
+        self.prune_to = QSpinBox(); self.prune_to.setRange(0, 50000); self.prune_to.setValue(0)
+        self.prune_to.setToolTip(
+            "Optional hard-cap pruning. If > 0, generates up to 'Stop at shapes' "
+            "to maximize detail, then smartly deletes the least visually important "
+            "shapes until exactly this many remain. Example: Stop at 4000, Prune to 2000."
+        )
         self.random_samples = QSpinBox(); self.random_samples.setRange(10, 50000); self.random_samples.setValue(1000)
         self.random_samples.setToolTip(
             "Per shape: how many random candidate shapes the generator tries "
@@ -141,6 +147,7 @@ class SettingsPanel(QWidget):
         # explicitly and mirror each field's tooltip onto its label.
         for label_text, field in (
             ("Stop at shapes", self.stop_at),
+            ("Prune To (0=off)", self.prune_to),
             ("Random samples", self.random_samples),
             ("Mutated samples", self.mutated_samples),
             ("Max resolution (px)", self.max_resolution),
@@ -316,12 +323,13 @@ class SettingsPanel(QWidget):
         for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
             w.blockSignals(True)
         self.stop_at.setValue(prof.stop_at)
+        self.prune_to.setValue(getattr(prof, "prune_to", 0))
         self.random_samples.setValue(prof.random_samples)
         self.mutated_samples.setValue(prof.mutated_samples)
         self.max_resolution.setValue(prof.max_resolution)
         self.max_threads.setValue(prof.max_threads)
         self.preview_every.setValue(prof.preview_every)
-        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
+        for w in (self.stop_at, self.prune_to, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
             w.blockSignals(False)
         for code, cb in self._shape_checks.items():
             cb.blockSignals(True)
@@ -356,6 +364,7 @@ class SettingsPanel(QWidget):
             except Exception:
                 pass
         base.stop_at = self.stop_at.value()
+        base.prune_to = self.prune_to.value()
         base.random_samples = self.random_samples.value()
         base.mutated_samples = self.mutated_samples.value()
         base.max_resolution = self.max_resolution.value()
