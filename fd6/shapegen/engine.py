@@ -411,6 +411,103 @@ class Engine:
             self.rms = new_rms
             self.shapes.append(s)
 
+    def _prune_shapes(self) -> None:
+        """Removes shapes that are 100% hidden or contribute insignificantly to the final image."""
+        if not self.shapes:
+            return
+
+        # Boolean mask tracking which pixels are completely occluded by top shapes
+        occluded = np.zeros((self.h, self.w), dtype=bool)
+
+        pruned_shapes = []
+        # Store index for fast partial redraws
+        valid_indices = []
+
+        # Pass 1: 100% Occlusion Culling (Fast)
+        for i, s in reversed(list(enumerate(self.shapes))):
+            mask_local, bbox = s.rasterize_mask(self.w, self.h)
+            x0, y0, x1, y1 = bbox
+
+            if x1 <= x0 or y1 <= y0 or mask_local.size == 0:
+                continue
+
+            shape_body = mask_local > 0
+            if not shape_body.any():
+                continue
+
+            region_occluded = occluded[y0:y1, x0:x1]
+
+            if np.all(region_occluded[shape_body]):
+                # 100% occluded, drop it
+                continue
+
+            pruned_shapes.append(s)
+            valid_indices.append(i)
+
+            if s.color[3] >= 254:
+                solid_body = mask_local >= 254
+                region_occluded[solid_body] = True
+
+        pruned_shapes.reverse()
+        valid_indices.reverse()
+
+        occlusion_removed = len(self.shapes) - len(pruned_shapes)
+
+        # Pass 2: Contribution Pruning (Slightly slower, extremely effective)
+        # We start from the bottom layer and ask: "If we don't draw this shape, does the final canvas change much?"
+        # To do this efficiently, we maintain a "running canvas" representing the layers drawn so far.
+
+        final_shapes = []
+        contribution_removed = 0
+
+        if self.alpha_mask is not None:
+            mask3 = (self.alpha_mask > 0)[:, :, None]
+            base_canvas = np.full((self.h, self.w, 3), 40, dtype=np.uint8)
+        else:
+            avg = self.target.reshape(-1, 3).mean(axis=0).astype(np.uint8)
+            base_canvas = np.tile(avg, (self.h, self.w, 1)).astype(np.uint8)
+
+        running_canvas = base_canvas.copy()
+
+        for idx, s in enumerate(pruned_shapes):
+            mask_local, bbox = s.rasterize_mask(self.w, self.h)
+            x0, y0, x1, y1 = bbox
+
+            # Draw the shape locally onto the running canvas to see its *immediate* impact
+            region_cur = running_canvas[y0:y1, x0:x1].astype(np.float32)
+
+            if self.alpha_mask is not None:
+                region_alpha = self.alpha_mask[y0:y1, x0:x1]
+                effective_mask = np.minimum(mask_local, region_alpha)
+            else:
+                effective_mask = mask_local
+
+            a = s.color[3] / 255.0
+            src = np.array(s.color[:3], dtype=np.float32)
+            m = (effective_mask.astype(np.float32) / 255.0)[:, :, None]
+
+            blended = m * (a * src + (1.0 - a) * region_cur) + (1.0 - m) * region_cur
+
+            # Calculate how much this shape actually changed the pixels underneath it
+            diff = np.abs(blended - region_cur)
+            max_change = diff.max()
+
+            # If the shape barely changed any pixel's color (e.g. less than 2/255 out of RGB),
+            # or its opacity is so low it does almost nothing, we drop it.
+            # This catches shapes that are 99% occluded or practically invisible.
+            if max_change < 2.0:
+                contribution_removed += 1
+                continue
+
+            # If it contributed enough, we commit it to the running canvas
+            running_canvas[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
+            final_shapes.append(s)
+
+        if occlusion_removed > 0 or contribution_removed > 0:
+            logger.info(f"Pruned {occlusion_removed} occluded shapes and {contribution_removed} negligible shapes.")
+
+        self.shapes = final_shapes
+
     # Residual reblend disabled in v0.4.0 — the size-schedule + edge-weight
     # combination already moves enough budget into detail regions on its own;
     # leaving the residual on top biased the back-half of generation toward
@@ -637,6 +734,9 @@ class Engine:
 
                 if count in save_at or (p.save_every and count % p.save_every == 0):
                     yield EngineEvent(kind="checkpoint", shape_count=count, rms=self.rms)
+
+            # Final occlusion culling
+            self._prune_shapes()
 
             yield EngineEvent(kind="done", shape_count=len(self.shapes), rms=self.rms, canvas=self._preview_canvas())
         except EngineWorkerError as exc:
