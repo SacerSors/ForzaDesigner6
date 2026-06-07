@@ -331,6 +331,20 @@ class PyTorchDiffRenderer:
 
         return grid, cur_t, tgt_t, alpha_t, edge_t
 
+    def shutdown(self) -> None:
+        """Frees PyTorch memory pool allocations and releases VRAM back to the OS."""
+        # Delete internal tensors that might hold memory
+        if hasattr(self, 'target'):
+            del self.target
+        if hasattr(self, 'edge_weight'):
+            del self.edge_weight
+        if hasattr(self, 'alpha_mask'):
+            del self.alpha_mask
+
+        # Empty the GPU memory cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def search(self, canvas: np.ndarray, n_random: int, n_mutate: int, max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
         # Collect available shape types
         types = ["rotated_ellipse"] # default fallback

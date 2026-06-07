@@ -646,6 +646,12 @@ class Engine:
 
     def _shutdown(self) -> None:
         try:
+            if self._backend == "pytorch" and self._gpu is not None:
+                if hasattr(self._gpu, "shutdown"):
+                    self._gpu.shutdown()
+        except Exception:
+            pass
+        try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
