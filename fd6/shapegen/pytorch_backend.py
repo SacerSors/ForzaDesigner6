@@ -53,8 +53,36 @@ class PyTorchDiffRenderer:
         # Precompute normalized grids for grid_sample
         # F.grid_sample expects coordinates in [-1, 1] for (x, y)
 
-    def _random_params(self, shape_type: str, b: int, w: int, h: int, max_size_frac: Optional[float], rng: random.Random) -> torch.Tensor:
-        """Generates random parameters for shapes. Parameters are generated directly on the device."""
+    def _generate_base_xy(self, b: int, w: int, h: int, rng: random.Random) -> torch.Tensor:
+        """Generates base (X, Y) coordinates to be shared across all shape types."""
+        seed = rng.randint(0, 2**31 - 1)
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(seed)
+
+        xy = torch.empty((b, 2), dtype=torch.float32, device=self.device)
+
+        # 25% error-weighted placement
+        b_err = int(b * 0.25)
+
+        if b_err > 0:
+            flat_edge_weight = self.edge_weight.view(-1)
+            if flat_edge_weight.sum() > 1e-5:
+                sampled_indices = torch.multinomial(flat_edge_weight, b_err, replacement=True, generator=gen)
+                xy[:b_err, 0] = (sampled_indices % w).float()
+                xy[:b_err, 1] = (sampled_indices // w).float()
+            else:
+                xy[:b_err, 0] = (w - 1) * torch.rand(b_err, generator=gen, device=self.device)
+                xy[:b_err, 1] = (h - 1) * torch.rand(b_err, generator=gen, device=self.device)
+
+        if b > b_err:
+            xy[b_err:, 0] = (w - 1) * torch.rand(b - b_err, generator=gen, device=self.device)
+            xy[b_err:, 1] = (h - 1) * torch.rand(b - b_err, generator=gen, device=self.device)
+
+        return xy
+
+    def _random_params(self, shape_type: str, base_xy: torch.Tensor, w: int, h: int, max_size_frac: Optional[float], rng: random.Random) -> torch.Tensor:
+        """Generates random parameters for shapes, inheriting X/Y coords so all shapes compete exactly."""
+        b = base_xy.shape[0]
         if max_size_frac is None:
             rx_cap = max(2.0, w / 8.0)
             ry_cap = max(2.0, h / 8.0)
@@ -62,48 +90,26 @@ class PyTorchDiffRenderer:
             rx_cap = max(2.0, (w * max_size_frac) / 2.0)
             ry_cap = max(2.0, (h * max_size_frac) / 2.0)
 
-        # Seed PyTorch RNG based on Python's random state
         seed = rng.randint(0, 2**31 - 1)
         gen = torch.Generator(device=self.device)
         gen.manual_seed(seed)
 
         out = torch.empty((b, 6), dtype=torch.float32, device=self.device)
 
-        # 25% error-weighted placement
-        b_err = int(b * 0.25)
+        # Share the exact same coordinates!
+        out[:, 0] = base_xy[:, 0]
+        out[:, 1] = base_xy[:, 1]
 
-        if b_err > 0:
-            # Flatten edge_weight for multinomial sampling
-            flat_edge_weight = self.edge_weight.view(-1)
-            # torch.multinomial requires non-negative weights, and it handles zeros
-            # but requires sum > 0.
-            if flat_edge_weight.sum() > 1e-5:
-                # Sample 1D indices
-                sampled_indices = torch.multinomial(flat_edge_weight, b_err, replacement=True, generator=gen)
-                # Convert to 2D coordinates
-                out[:b_err, 0] = (sampled_indices % w).float()
-                out[:b_err, 1] = (sampled_indices // w).float()
-            else:
-                out[:b_err, 0] = (w - 1) * torch.rand(b_err, generator=gen, device=self.device)
-                out[:b_err, 1] = (h - 1) * torch.rand(b_err, generator=gen, device=self.device)
-
-        if b > b_err:
-            out[b_err:, 0] = (w - 1) * torch.rand(b - b_err, generator=gen, device=self.device)
-            out[b_err:, 1] = (h - 1) * torch.rand(b - b_err, generator=gen, device=self.device)
-
-        # Standard uniform macro: a + (b - a) * rand()
         def uniform(idx, a, b_val):
             out[:, idx] = a + (b_val - a) * torch.rand(b, generator=gen, device=self.device)
 
-        # Optimizable Opacity initialization:
-        # Start random alpha between 0.1 and 1.0
+        # Optimizable Opacity
         uniform(5, 0.1, 1.0)
 
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap if shape_type != "circle" else rx_cap)
             if shape_type == "rotated_ellipse":
-                # Edge-Aligned Spawning
                 cx = torch.clamp(out[:, 0].long(), 0, w - 1)
                 cy = torch.clamp(out[:, 1].long(), 0, h - 1)
                 out[:, 4] = self.edge_dir[cy, cx]
@@ -114,7 +120,6 @@ class PyTorchDiffRenderer:
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap)
             if shape_type == "rotated_rectangle":
-                # Edge-Aligned Spawning
                 cx = torch.clamp(out[:, 0].long(), 0, w - 1)
                 cy = torch.clamp(out[:, 1].long(), 0, h - 1)
                 out[:, 4] = self.edge_dir[cy, cx]
@@ -123,7 +128,6 @@ class PyTorchDiffRenderer:
 
         elif shape_type == "triangle":
             uniform(2, 10, max(10, w * (max_size_frac or 0.25)))
-            # Edge-Aligned Spawning
             cx = torch.clamp(out[:, 0].long(), 0, w - 1)
             cy = torch.clamp(out[:, 1].long(), 0, h - 1)
             out[:, 3] = self.edge_dir[cy, cx]
@@ -313,23 +317,15 @@ class PyTorchDiffRenderer:
 
         return score, color
 
-    def _extract_tiles(self, params: torch.Tensor, cur_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Extracts local cropped patches for each shape to prevent massive VRAM use.
-        Returns: grid (B, T, T, 2), cur_t, tgt_t, alpha_t, edge_t
-        """
-        B = params.shape[0]
-        # Calculate optimal tile size
-        max_r = torch.max(torch.maximum(params[:, 2], params[:, 3])).item() if B else 1.0
-        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(max_r) + 2)))
+    def _extract_tiles_core(self, xy: torch.Tensor, T: int, cur_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Core tile extraction decoupled from full shape params so different shapes can share the tile."""
+        B = xy.shape[0]
 
-        # Create un-normalized grid offsets
         y_off, x_off = torch.meshgrid(torch.arange(T, device=self.device),
                                       torch.arange(T, device=self.device), indexing='ij')
 
-        # Centers
-        cx = torch.round(params[:, 0]).long()
-        cy = torch.round(params[:, 1]).long()
+        cx = torch.round(xy[:, 0]).long()
+        cy = torch.round(xy[:, 1]).long()
 
         x0 = cx - T // 2
         y0 = cy - T // 2
@@ -353,6 +349,19 @@ class PyTorchDiffRenderer:
         grid = torch.stack([gx.float(), gy.float()], dim=-1) # (B, T, T, 2)
 
         return grid, cur_t, tgt_t, alpha_t, edge_t
+
+    def _extract_tiles(self, params: torch.Tensor, cur_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extracts local cropped patches for each shape to prevent massive VRAM use.
+        Returns: grid (B, T, T, 2), cur_t, tgt_t, alpha_t, edge_t
+        """
+        B = params.shape[0]
+        # Calculate optimal tile size
+        max_r = torch.max(torch.maximum(params[:, 2], params[:, 3])).item() if B else 1.0
+        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(max_r) + 2)))
+
+        xy = params[:, 0:2]
+        return self._extract_tiles_core(xy, T, cur_tensor)
 
     def shutdown(self) -> None:
         """Frees PyTorch memory pool allocations and releases VRAM back to the OS."""
@@ -385,7 +394,46 @@ class PyTorchDiffRenderer:
 
         n_random = max(1, n_random)
 
-        # We will track the best shapes across all evaluated types
+        # Pre-generate exactly n_random base coordinates
+        base_xy = self._generate_base_xy(n_random, self.w, self.h, rng)
+
+        # Generate parameters for all shapes sharing the exact same coordinates!
+        type_params = {}
+        global_max_r = 1.0
+
+        for shape_type in types:
+            p = self._random_params(shape_type, base_xy, self.w, self.h, max_size_frac, rng)
+            type_params[shape_type] = p
+            t_max = torch.max(torch.maximum(p[:, 2], p[:, 3])).item() if n_random else 1.0
+            global_max_r = max(global_max_r, t_max)
+
+        # Calculate optimal tile size T globally for all competing shapes
+        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(global_max_r) + 2)))
+
+        # Dynamic Chunk Sizing based on global T
+        bytes_per_tile = T * T * 3 * 4
+        chunk_size = max(2, int((256 * 1024 * 1024) / max(1, bytes_per_tile)))
+        chunk_size = min(chunk_size, n_random)
+
+        # We will track all scores for all types
+        type_scores = {t: [] for t in types}
+        type_colors = {t: [] for t in types}
+
+        # SHARED TILE EVALUATION
+        # We loop over the chunk indices once, extract the VRAM tile exactly ONCE,
+        # and evaluate all active shape types sequentially over the same hot L1 cache memory!
+        with torch.no_grad():
+            for i in range(0, n_random, chunk_size):
+                xy_chunk = base_xy[i:i+chunk_size]
+                grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles_core(xy_chunk, T, cur_tensor)
+
+                for shape_type in types:
+                    p_chunk = type_params[shape_type][i:i+chunk_size]
+                    mask = self._get_mask(shape_type, grid, p_chunk)
+                    sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq, p_chunk)
+                    type_scores[shape_type].append(sc)
+                    type_colors[shape_type].append(col)
+
         overall_best_score = float('inf')
         overall_best_params = None
         overall_best_color = None
@@ -399,44 +447,13 @@ class PyTorchDiffRenderer:
             rx_cap = max(2.0, (self.w * max_size_frac) / 2.0)
             ry_cap = max(2.0, (self.h * max_size_frac) / 2.0)
 
-        # Evenly divide random samples among the available shape types so that each place
-        # isn't just randomly assigned a type, but rather we try all active shape types
-        # across the batches and let them compete for the best score.
-        samples_per_type = max(1, n_random // len(types))
-
+        # Optimize the Top K candidates for each type
         for shape_type in types:
-            params = self._random_params(shape_type, samples_per_type, self.w, self.h, max_size_frac, rng)
+            all_scores = torch.cat(type_scores[shape_type])
+            all_colors = torch.cat(type_colors[shape_type])
+            params = type_params[shape_type]
 
-            # Calculate optimal tile size T for this entire type batch
-            max_r = torch.max(torch.maximum(params[:, 2], params[:, 3])).item() if samples_per_type else 1.0
-            T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(max_r) + 2)))
-
-            # Dynamic Chunk Sizing: Cap the forward pass at ~256MB of VRAM to prevent
-            # PyTorch from starving the OS composer, while allowing tiny shapes
-            # to evaluate 10,000+ candidates simultaneously for extreme speed.
-            # T*T pixels * 3 channels * 4 bytes per float32
-            bytes_per_tile = T * T * 3 * 4
-            chunk_size = max(2, int((256 * 1024 * 1024) / max(1, bytes_per_tile)))
-            chunk_size = min(chunk_size, samples_per_type)
-
-            scores_list = []
-            colors_list = []
-
-            with torch.no_grad():
-                for i in range(0, samples_per_type, chunk_size):
-                    p_chunk = params[i:i+chunk_size]
-                    grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles(p_chunk, cur_tensor)
-
-                    mask = self._get_mask(shape_type, grid, p_chunk)
-                    sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq, p_chunk)
-                    scores_list.append(sc)
-                    colors_list.append(col)
-
-            all_scores = torch.cat(scores_list)
-            all_colors = torch.cat(colors_list)
-
-            # Select top K candidates for optimization for THIS shape type
-            K = min(16, samples_per_type)
+            K = min(16, n_random)
             sorted_scores, sorted_indices = torch.sort(all_scores)
             top_indices = sorted_indices[:K]
 
@@ -446,7 +463,6 @@ class PyTorchDiffRenderer:
 
             top_params = params[top_indices].clone().detach().requires_grad_(True)
 
-            # Optimize top K candidates
             best_idx = 0
             best_opt_score = best_score
             best_opt_params = top_params[0].detach().clone()
