@@ -326,7 +326,7 @@ class PyTorchDiffRenderer:
         n_random = max(1, n_random)
         params = self._random_params(shape_type, n_random, self.w, self.h, max_size_frac, rng)
 
-        chunk_size = 64
+        chunk_size = 512
         scores_list = []
         colors_list = []
 
@@ -355,9 +355,9 @@ class PyTorchDiffRenderer:
 
         top_params = params[top_indices].clone().detach().requires_grad_(True)
 
-        # 3. Optimize top K candidates via Manual Gradient Descent
-        # We manually update weights to avoid torch.optim.Adam segfaulting
-        # on ROCm inside a background QThread.
+        # 3. Optimize top K candidates via Manual Adam Gradient Descent
+        # We manually update weights using the Adam algorithm formulas
+        # to avoid torch.optim.Adam segfaulting on ROCm inside a background QThread.
 
         best_idx = 0
         best_opt_score = best_score
@@ -365,12 +365,18 @@ class PyTorchDiffRenderer:
         best_opt_color = all_colors[top_indices[0]].detach().clone()
 
         n_mutate = max(1, n_mutate)
-        lr = 1.0
 
         # We need to re-extract tiles for the top K before optimizing
         grid_top, cur_t_top, tgt_t_top, alpha_t_top, edge_t_top = self._extract_tiles(top_params, cur_tensor)
 
-        for _ in range(n_mutate):
+        lr = 1.0
+        m = torch.zeros_like(top_params)
+        v = torch.zeros_like(top_params)
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = 1e-8
+
+        for t in range(1, n_mutate + 1):
             if top_params.grad is not None:
                 top_params.grad.zero_()
 
@@ -384,9 +390,16 @@ class PyTorchDiffRenderer:
 
             loss.backward()
 
-            # Manual SGD step
+            # Manual Adam step
             with torch.no_grad():
-                top_params -= lr * top_params.grad
+                grad = top_params.grad
+                m = beta1 * m + (1 - beta1) * grad
+                v = beta2 * v + (1 - beta2) * (grad ** 2)
+
+                m_hat = m / (1 - beta1 ** t)
+                v_hat = v / (1 - beta2 ** t)
+
+                top_params -= lr * m_hat / (torch.sqrt(v_hat) + eps)
 
             # Check if any score improved
             with torch.no_grad():
