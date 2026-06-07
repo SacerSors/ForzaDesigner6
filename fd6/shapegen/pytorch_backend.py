@@ -50,14 +50,18 @@ class PyTorchDiffRenderer:
         # F.grid_sample expects coordinates in [-1, 1] for (x, y)
         self.generator = torch.Generator(device=self.device)
 
-    def _random_params(self, shape_type: str, b: int, w: int, h: int, max_size_frac: Optional[float], rng: random.Random) -> torch.Tensor:
-        """Generates random parameters for shapes. Parameters are generated directly on the device."""
+    def _random_params(self, shape_type: str, b: int, w: int, h: int, min_size_frac: float, max_size_frac: Optional[float],
+                       rng: random.Random, error_map: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Generates random parameters for shapes.
+        Uses error-guided placement (80% based on error map probability) to spawn candidates exactly where needed.
+        """
         if max_size_frac is None:
-            rx_cap = max(2.0, w / 8.0)
-            ry_cap = max(2.0, h / 8.0)
-        else:
-            rx_cap = max(2.0, (w * max_size_frac) / 2.0)
-            ry_cap = max(2.0, (h * max_size_frac) / 2.0)
+            max_size_frac = 0.25
+
+        rx_min = max(2.0, (w * min_size_frac) / 2.0)
+        ry_min = max(2.0, (h * min_size_frac) / 2.0)
+        rx_cap = max(rx_min, (w * max_size_frac) / 2.0)
+        ry_cap = max(ry_min, (h * max_size_frac) / 2.0)
 
         # Seed PyTorch RNG based on Python's random state
         seed = rng.randint(0, 2**31 - 1)
@@ -65,34 +69,66 @@ class PyTorchDiffRenderer:
 
         out = torch.empty((b, 5), dtype=torch.float32, device=self.device)
 
-        # Standard uniform macro: a + (b - a) * rand()
+        # Determine (cx, cy) using error map for 80% of candidates, uniform random for 20%
+        if error_map is not None and torch.sum(error_map) > 1e-5:
+            # Flatten error map and create a probability distribution
+            probs = error_map.flatten()
+            # If all errors are zero or negative somehow, fallback to uniform
+            probs = torch.clamp(probs, min=0.0)
+            sum_p = torch.sum(probs)
+            if sum_p > 1e-5:
+                probs = probs / sum_p
+
+                # 80% error-guided
+                num_guided = int(b * 0.8)
+                num_uniform = b - num_guided
+
+                if num_guided > 0:
+                    indices = torch.multinomial(probs, num_guided, replacement=True, generator=self.generator)
+                    guided_y = torch.div(indices, w, rounding_mode='floor').float()
+                    guided_x = (indices % w).float()
+
+                    # Add sub-pixel jitter
+                    guided_y += torch.rand(num_guided, generator=self.generator, device=self.device) - 0.5
+                    guided_x += torch.rand(num_guided, generator=self.generator, device=self.device) - 0.5
+
+                    out[:num_guided, 0] = torch.clamp(guided_x, 0.0, float(w - 1))
+                    out[:num_guided, 1] = torch.clamp(guided_y, 0.0, float(h - 1))
+
+                if num_uniform > 0:
+                    out[num_guided:, 0] = torch.rand(num_uniform, generator=self.generator, device=self.device) * (w - 1)
+                    out[num_guided:, 1] = torch.rand(num_uniform, generator=self.generator, device=self.device) * (h - 1)
+            else:
+                out[:, 0] = torch.rand(b, generator=self.generator, device=self.device) * (w - 1)
+                out[:, 1] = torch.rand(b, generator=self.generator, device=self.device) * (h - 1)
+        else:
+            out[:, 0] = torch.rand(b, generator=self.generator, device=self.device) * (w - 1)
+            out[:, 1] = torch.rand(b, generator=self.generator, device=self.device) * (h - 1)
+
+        # Standard uniform macro for other params
         def uniform(idx, a, b_val):
             out[:, idx] = a + (b_val - a) * torch.rand(b, generator=self.generator, device=self.device)
 
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
-            uniform(2, 1, rx_cap)
-            uniform(3, 1, ry_cap if shape_type != "circle" else rx_cap)
+            uniform(2, rx_min, rx_cap)
+            uniform(3, ry_min, ry_cap if shape_type != "circle" else rx_cap)
             if shape_type == "rotated_ellipse":
                 uniform(4, 0, 2 * math.pi)
             else:
                 out[:, 4] = 0.0
 
         elif shape_type in ("rectangle", "rotated_rectangle"):
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
-            uniform(2, 1, rx_cap)
-            uniform(3, 1, ry_cap)
+            uniform(2, rx_min, rx_cap)
+            uniform(3, ry_min, ry_cap)
             if shape_type == "rotated_rectangle":
                 uniform(4, 0, 2 * math.pi)
             else:
                 out[:, 4] = 0.0
 
         elif shape_type == "triangle":
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
-            uniform(2, 10, max(10, w * (max_size_frac or 0.25)))
+            min_s = max(10.0, w * min_size_frac)
+            max_s = max(min_s, w * max_size_frac)
+            uniform(2, min_s, max_s)
             uniform(3, 0, 2 * math.pi)
             uniform(4, 0.5, 2.0)
         else:
@@ -313,7 +349,7 @@ class PyTorchDiffRenderer:
 
         return grid, cur_t, tgt_t, alpha_t, edge_t
 
-    def search(self, canvas: np.ndarray, n_random: int, n_mutate: int, max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
+    def search(self, canvas: np.ndarray, n_random: int, n_mutate: int, min_size_frac: float, max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
         # Randomly select one shape type if multiple are given, but engine calls search with ONE type due to rotation
         shape_type = "rotated_ellipse" # default fallback
         if hasattr(self, '_current_type'):
@@ -324,9 +360,14 @@ class PyTorchDiffRenderer:
 
         full_sq = (((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)).sum()
 
+        # Calculate error map (sum of squared diffs per pixel, edge-weighted)
+        # Use this to guide where the shapes spawn
+        diff_sq = ((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)
+        error_map = diff_sq.sum(dim=-1) # (H, W)
+
         # 1. Random Search via Forward Pass in chunks to prevent OOM
         n_random = max(1, n_random)
-        params = self._random_params(shape_type, n_random, self.w, self.h, max_size_frac, rng)
+        params = self._random_params(shape_type, n_random, self.w, self.h, min_size_frac, max_size_frac, rng, error_map)
 
         chunk_size = 64
         scores_list = []

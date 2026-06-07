@@ -427,23 +427,22 @@ class Engine:
         boost = 1.0 + (self.RESIDUAL_BOOST - 1.0) * diff.astype(np.float32)
         self.edge_weight[:] = self._base_edge_weight * boost
 
-    def _max_size_frac_for_progress(self, progress: float) -> float:
-        """Shape-size schedule. Monotonically decreasing across iteration progress.
+    def _max_size_frac_for_progress(self, progress: float) -> tuple[float, float]:
+        """Shape-size schedule (min, max). Monotonically decreasing.
 
-        Per-candidate scoring cost is O(bbox_area) and bbox area scales with
-        `max_size_frac²`, so an early tier with `max_size_frac=1.0` (canvas-
-        spanning shapes) is ~16× more expensive than the legacy `0.25`
-        default. The values below keep T1 noticeably larger than legacy (for
-        tonal coverage) without exploding scoring cost at higher
-        max_resolutions (4K / 8K targets).
+        The first 5% of shapes are allowed to span the entire canvas to block
+        out massive background colors (e.g. skies, borders). Lower limits
+        ensure the engine doesn't waste early iterations on tiny details.
         """
+        if progress < 0.05:
+            return 0.20, 1.00  # 0-5%: Huge blockouts
         if progress < 0.25:
-            return 0.30        # 0–25%: ~30% canvas — modest bump over legacy for tonal blocks
+            return 0.05, 0.40  # 5-25%: Large shapes
         if progress < 0.50:
-            return 0.22        # 26–50%: ~22% canvas
+            return 0.02, 0.22  # 26-50%: Medium
         if progress < 0.75:
-            return 0.15        # 51–75%: ~15% canvas
-        return 0.10            # 76–100%: 10% canvas — fine detail only
+            return 0.01, 0.15  # 51-75%: Small
+        return 0.0, 0.10       # 76-100%: Fine detail
 
     def _parallel_search(self, types: list[str], n_random: int, n_mutate: int,
                          max_size_frac: float | None = None) -> tuple[float, Shape | None]:
@@ -498,7 +497,7 @@ class Engine:
         return best_score, best_shape
 
     def _search(self, types: list[str], n_random: int, n_mutate: int,
-                max_size_frac: float | None = None) -> tuple[float, Shape | None]:
+                min_size_frac: float = 0.0, max_size_frac: float | None = None) -> tuple[float, Shape | None]:
         """Dispatch one iteration's search to the active backend.
 
         GPU runs in the main process (one batched search). If a GPU op fails at
@@ -509,7 +508,7 @@ class Engine:
             try:
                 # PyTorch backend needs to know which type to search for
                 self._gpu._current_type = types[0] if types else "rotated_ellipse"
-                return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
+                return self._gpu.search(self.canvas, n_random, n_mutate, min_size_frac, max_size_frac, self.rng)
             except Exception as exc:
                 self._backend = "cpu"
                 self._gpu = None
@@ -555,11 +554,17 @@ class Engine:
                 type_cursor += 1
 
                 progress = len(self.shapes) / max(1, p.stop_at)
-                size_cap = self._max_size_frac_for_progress(progress)
+
+                # Check if we should use the new min/max tuple (PyTorch mode mostly uses this)
+                size_res = self._max_size_frac_for_progress(progress)
+                if isinstance(size_res, tuple):
+                    min_cap, size_cap = size_res
+                else:
+                    min_cap, size_cap = 0.0, size_res
 
                 refined_score, refined = self._search(
                     iter_types, max(1, p.random_samples), max(1, p.mutated_samples),
-                    max_size_frac=size_cap,
+                    min_size_frac=min_cap, max_size_frac=size_cap,
                 )
                 # If the GPU degraded to CPU mid-run, announce the new backend once.
                 if self._backend != self._backend_announced:
@@ -579,7 +584,7 @@ class Engine:
                             break
                         refined_score, refined = self._search(
                             iter_types, max(1, p.random_samples), max(1, p.mutated_samples),
-                            max_size_frac=size_cap,
+                            min_size_frac=min_cap, max_size_frac=size_cap,
                         )
                         sticker_attempts += 1
                     else:
