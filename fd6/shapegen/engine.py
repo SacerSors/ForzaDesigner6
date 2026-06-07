@@ -411,7 +411,7 @@ class Engine:
     # leaving the residual on top biased the back-half of generation toward
     # smearing big shapes over high-error areas (the opposite of what we
     # want). Flip RESIDUAL_REFRESH_EVERY back to a finite value to re-enable.
-    RESIDUAL_REFRESH_EVERY = 0
+    RESIDUAL_REFRESH_EVERY = 20
     RESIDUAL_BOOST = 4.0
 
     def _refresh_residual_weight(self) -> None:
@@ -427,8 +427,11 @@ class Engine:
         boost = 1.0 + (self.RESIDUAL_BOOST - 1.0) * diff.astype(np.float32)
         self.edge_weight[:] = self._base_edge_weight * boost
 
-    def _max_size_frac_for_progress(self, progress: float) -> float:
+    def _max_size_frac_for_progress(self, shape_count: int, progress: float) -> float:
         """Shape-size schedule. Monotonically decreasing across iteration progress.
+
+        Allows the first 20 shapes to be up to 100% of the canvas size to serve
+        as large background fills.
 
         Per-candidate scoring cost is O(bbox_area) and bbox area scales with
         `max_size_frac²`, so an early tier with `max_size_frac=1.0` (canvas-
@@ -437,6 +440,9 @@ class Engine:
         tonal coverage) without exploding scoring cost at higher
         max_resolutions (4K / 8K targets).
         """
+        if shape_count < 20:
+            return 1.0         # First 20 shapes: 100% canvas for background fills
+
         if progress < 0.25:
             return 0.30        # 0–25%: ~30% canvas — modest bump over legacy for tonal blocks
         if progress < 0.50:
@@ -507,8 +513,8 @@ class Engine:
         """
         if self._backend == "pytorch" and self._gpu is not None:
             try:
-                # PyTorch backend needs to know which type to search for
-                self._gpu._current_type = types[0] if types else "rotated_ellipse"
+                # PyTorch backend needs to know which types to search for
+                self._gpu._current_types = types if types else ["rotated_ellipse"]
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
             except Exception as exc:
                 self._backend = "cpu"
@@ -551,11 +557,11 @@ class Engine:
                 while self._pause and not self._stop:
                     time.sleep(0.05)
 
-                iter_types = [types[type_cursor % len(types)]]
-                type_cursor += 1
+                iter_types = types
 
-                progress = len(self.shapes) / max(1, p.stop_at)
-                size_cap = self._max_size_frac_for_progress(progress)
+                shape_count = len(self.shapes)
+                progress = shape_count / max(1, p.stop_at)
+                size_cap = self._max_size_frac_for_progress(shape_count, progress)
 
                 refined_score, refined = self._search(
                     iter_types, max(1, p.random_samples), max(1, p.mutated_samples),

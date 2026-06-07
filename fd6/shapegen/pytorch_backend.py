@@ -64,13 +64,33 @@ class PyTorchDiffRenderer:
 
         out = torch.empty((b, 5), dtype=torch.float32, device=self.device)
 
+        # 25% error-weighted placement
+        b_err = int(b * 0.25)
+
+        if b_err > 0:
+            # Flatten edge_weight for multinomial sampling
+            flat_edge_weight = self.edge_weight.view(-1)
+            # torch.multinomial requires non-negative weights, and it handles zeros
+            # but requires sum > 0.
+            if flat_edge_weight.sum() > 1e-5:
+                # Sample 1D indices
+                sampled_indices = torch.multinomial(flat_edge_weight, b_err, replacement=True, generator=gen)
+                # Convert to 2D coordinates
+                out[:b_err, 0] = (sampled_indices % w).float()
+                out[:b_err, 1] = (sampled_indices // w).float()
+            else:
+                out[:b_err, 0] = (w - 1) * torch.rand(b_err, generator=gen, device=self.device)
+                out[:b_err, 1] = (h - 1) * torch.rand(b_err, generator=gen, device=self.device)
+
+        if b > b_err:
+            out[b_err:, 0] = (w - 1) * torch.rand(b - b_err, generator=gen, device=self.device)
+            out[b_err:, 1] = (h - 1) * torch.rand(b - b_err, generator=gen, device=self.device)
+
         # Standard uniform macro: a + (b - a) * rand()
         def uniform(idx, a, b_val):
             out[:, idx] = a + (b_val - a) * torch.rand(b, generator=gen, device=self.device)
 
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap if shape_type != "circle" else rx_cap)
             if shape_type == "rotated_ellipse":
@@ -79,8 +99,6 @@ class PyTorchDiffRenderer:
                 out[:, 4] = 0.0
 
         elif shape_type in ("rectangle", "rotated_rectangle"):
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap)
             if shape_type == "rotated_rectangle":
@@ -89,8 +107,6 @@ class PyTorchDiffRenderer:
                 out[:, 4] = 0.0
 
         elif shape_type == "triangle":
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
             uniform(2, 10, max(10, w * (max_size_frac or 0.25)))
             uniform(3, 0, 2 * math.pi)
             uniform(4, 0.5, 2.0)
@@ -316,138 +332,153 @@ class PyTorchDiffRenderer:
         return grid, cur_t, tgt_t, alpha_t, edge_t
 
     def search(self, canvas: np.ndarray, n_random: int, n_mutate: int, max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
-        # Randomly select one shape type if multiple are given, but engine calls search with ONE type due to rotation
-        shape_type = "rotated_ellipse" # default fallback
-        if hasattr(self, '_current_type'):
-            shape_type = self._current_type
+        # Collect available shape types
+        types = ["rotated_ellipse"] # default fallback
+        if hasattr(self, '_current_types') and self._current_types:
+            types = self._current_types
 
         cur_tensor = torch.from_numpy(np.array(canvas, copy=True)).float().to(self.device, non_blocking=True) / 255.0
 
+        # If the backend is tracking an external LIVE edge_weight reference (passed from engine),
+        # sync it to the device before searching so dynamic error placement updates work.
+        if hasattr(self, '_external_edge_weight') and self._external_edge_weight is not None:
+            self.edge_weight.copy_(torch.from_numpy(self._external_edge_weight).float())
+
         full_sq = (((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)).sum()
 
-        # 1. Random Search via Forward Pass in chunks to prevent OOM
         n_random = max(1, n_random)
-        params = self._random_params(shape_type, n_random, self.w, self.h, max_size_frac, rng)
-
         chunk_size = 512
-        scores_list = []
-        colors_list = []
 
-        with torch.no_grad():
-            for i in range(0, n_random, chunk_size):
-                p_chunk = params[i:i+chunk_size]
-                grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles(p_chunk, cur_tensor)
+        # We will track the best shapes across all evaluated types
+        overall_best_score = float('inf')
+        overall_best_params = None
+        overall_best_color = None
+        overall_best_type = None
 
-                mask = self._get_mask(shape_type, grid, p_chunk)
-                sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq)
-                scores_list.append(sc)
-                colors_list.append(col)
+        # Evenly divide random samples among the available shape types so that each place
+        # isn't just randomly assigned a type, but rather we try all active shape types
+        # across the batches and let them compete for the best score.
+        samples_per_type = max(1, n_random // len(types))
 
-        all_scores = torch.cat(scores_list)
-        all_colors = torch.cat(colors_list)
+        for shape_type in types:
+            params = self._random_params(shape_type, samples_per_type, self.w, self.h, max_size_frac, rng)
 
-        # 2. Select top K candidates for optimization
-        K = min(16, n_random)
-        # Using torch.sort instead of torch.topk to avoid unsupported ops and fallback
-        sorted_scores, sorted_indices = torch.sort(all_scores)
-        top_indices = sorted_indices[:K]
+            scores_list = []
+            colors_list = []
 
-        best_score = sorted_scores[0].item()
-        if not math.isfinite(best_score):
+            with torch.no_grad():
+                for i in range(0, samples_per_type, chunk_size):
+                    p_chunk = params[i:i+chunk_size]
+                    grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles(p_chunk, cur_tensor)
+
+                    mask = self._get_mask(shape_type, grid, p_chunk)
+                    sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq)
+                    scores_list.append(sc)
+                    colors_list.append(col)
+
+            all_scores = torch.cat(scores_list)
+            all_colors = torch.cat(colors_list)
+
+            # Select top K candidates for optimization for THIS shape type
+            K = min(16, samples_per_type)
+            sorted_scores, sorted_indices = torch.sort(all_scores)
+            top_indices = sorted_indices[:K]
+
+            best_score = sorted_scores[0].item()
+            if not math.isfinite(best_score):
+                continue
+
+            top_params = params[top_indices].clone().detach().requires_grad_(True)
+
+            # Optimize top K candidates
+            best_idx = 0
+            best_opt_score = best_score
+            best_opt_params = top_params[0].detach().clone()
+            best_opt_color = all_colors[top_indices[0]].detach().clone()
+
+            n_mutate = max(1, n_mutate)
+
+            grid_top, cur_t_top, tgt_t_top, alpha_t_top, edge_t_top = self._extract_tiles(top_params, cur_tensor)
+
+            lr = 1.0
+            m = torch.zeros_like(top_params)
+            v = torch.zeros_like(top_params)
+            beta1 = 0.9
+            beta2 = 0.999
+            eps = 1e-8
+
+            for t in range(1, n_mutate + 1):
+                if top_params.grad is not None:
+                    top_params.grad.zero_()
+
+                mask = self._get_mask(shape_type, grid_top, top_params)
+                sc, col = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask, full_sq)
+
+                loss = sc.mean()
+                if not math.isfinite(loss.item()):
+                    break
+
+                loss.backward()
+
+                with torch.no_grad():
+                    grad = top_params.grad
+                    m = beta1 * m + (1 - beta1) * grad
+                    v = beta2 * v + (1 - beta2) * (grad ** 2)
+
+                    m_hat = m / (1 - beta1 ** t)
+                    v_hat = v / (1 - beta2 ** t)
+
+                    top_params -= lr * m_hat / (torch.sqrt(v_hat) + eps)
+
+                with torch.no_grad():
+                    mask_eval = self._get_mask(shape_type, grid_top, top_params)
+                    sc_eval, col_eval = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq)
+
+                    min_sc, min_idx = torch.min(sc_eval, dim=0)
+                    if min_sc.item() < best_opt_score:
+                        best_opt_score = min_sc.item()
+                        best_idx = min_idx.item()
+                        best_opt_params = top_params[best_idx].detach().clone()
+                        best_opt_color = col_eval[best_idx].detach().clone()
+
+            # Compare with overall best
+            if best_opt_score < overall_best_score:
+                overall_best_score = best_opt_score
+                overall_best_params = best_opt_params
+                overall_best_color = best_opt_color
+                overall_best_type = shape_type
+
+        if overall_best_params is None:
             return float('inf'), None
 
-        top_params = params[top_indices].clone().detach().requires_grad_(True)
-
-        # 3. Optimize top K candidates via Manual Adam Gradient Descent
-        # We manually update weights using the Adam algorithm formulas
-        # to avoid torch.optim.Adam segfaulting on ROCm inside a background QThread.
-
-        best_idx = 0
-        best_opt_score = best_score
-        best_opt_params = top_params[0].detach().clone()
-        best_opt_color = all_colors[top_indices[0]].detach().clone()
-
-        n_mutate = max(1, n_mutate)
-
-        # We need to re-extract tiles for the top K before optimizing
-        grid_top, cur_t_top, tgt_t_top, alpha_t_top, edge_t_top = self._extract_tiles(top_params, cur_tensor)
-
-        lr = 1.0
-        m = torch.zeros_like(top_params)
-        v = torch.zeros_like(top_params)
-        beta1 = 0.9
-        beta2 = 0.999
-        eps = 1e-8
-
-        for t in range(1, n_mutate + 1):
-            if top_params.grad is not None:
-                top_params.grad.zero_()
-
-            mask = self._get_mask(shape_type, grid_top, top_params)
-            sc, col = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask, full_sq)
-
-            # Loss is the mean of scores
-            loss = sc.mean()
-            if not math.isfinite(loss.item()):
-                break
-
-            loss.backward()
-
-            # Manual Adam step
-            with torch.no_grad():
-                grad = top_params.grad
-                m = beta1 * m + (1 - beta1) * grad
-                v = beta2 * v + (1 - beta2) * (grad ** 2)
-
-                m_hat = m / (1 - beta1 ** t)
-                v_hat = v / (1 - beta2 ** t)
-
-                top_params -= lr * m_hat / (torch.sqrt(v_hat) + eps)
-
-            # Check if any score improved
-            with torch.no_grad():
-                mask_eval = self._get_mask(shape_type, grid_top, top_params)
-                sc_eval, col_eval = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq)
-
-                min_sc, min_idx = torch.min(sc_eval, dim=0)
-                if min_sc.item() < best_opt_score:
-                    best_opt_score = min_sc.item()
-                    best_idx = min_idx.item()
-                    best_opt_params = top_params[best_idx].detach().clone()
-                    best_opt_color = col_eval[best_idx].detach().clone()
-
-        # 4. Construct output shape
-        p_np = best_opt_params.cpu().numpy()
-        c_np = (best_opt_color.cpu().numpy() * 255.0).astype(np.int32)
+        # Construct output shape from overall best
+        p_np = overall_best_params.cpu().numpy()
+        c_np = (overall_best_color.cpu().numpy() * 255.0).astype(np.int32)
         color_tuple = (int(c_np[0]), int(c_np[1]), int(c_np[2]), int(_SEARCH_ALPHA * 255))
 
-        # Cast to standard python floats to avoid JSON serialization errors
         cx, cy = float(p_np[0]), float(p_np[1])
 
-        if shape_type in ("rotated_ellipse", "ellipse", "circle"):
+        if overall_best_type in ("rotated_ellipse", "ellipse", "circle"):
             rx, ry, angle = float(p_np[2]), float(p_np[3]), float(p_np[4])
             deg = math.degrees(angle) % 180.0
-            return best_opt_score, RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=rx, ry=ry, angle=deg)
+            return overall_best_score, RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=rx, ry=ry, angle=deg)
 
-        elif shape_type in ("rectangle", "rotated_rectangle"):
+        elif overall_best_type in ("rectangle", "rotated_rectangle"):
             from fd6.shapegen.shapes.rectangle import RotatedRectangle
             rx, ry, angle = float(p_np[2]), float(p_np[3]), float(p_np[4])
             deg = math.degrees(angle) % 180.0
-            if shape_type == "rotated_rectangle":
-                return best_opt_score, RotatedRectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry, angle=deg)
+            if overall_best_type == "rotated_rectangle":
+                return overall_best_score, RotatedRectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry, angle=deg)
             else:
-                return best_opt_score, Rectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry)
+                return overall_best_score, Rectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry)
 
-        elif shape_type == "triangle":
+        elif overall_best_type == "triangle":
             scale, angle, aspect = float(p_np[2]), float(p_np[3]), float(p_np[4])
             deg = math.degrees(angle) % 360.0
             h = scale * aspect
-            # For compatibility with legacy Triangle (usually defined by 3 points), we could return a specific triangle
-            # but let's assume Triangle(color, x, y, scale, angle) for now or similar constructor
             try:
-                return best_opt_score, Triangle(color=color_tuple, x=cx, y=cy, scale=scale, angle=deg, aspect=aspect)
+                return overall_best_score, Triangle(color=color_tuple, x=cx, y=cy, scale=scale, angle=deg, aspect=aspect)
             except TypeError:
-                # If Triangle constructor is different, we fallback to RotatedEllipse
-                return best_opt_score, RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=scale, ry=h/2, angle=deg)
+                return overall_best_score, RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=scale, ry=h/2, angle=deg)
 
         return float('inf'), None
