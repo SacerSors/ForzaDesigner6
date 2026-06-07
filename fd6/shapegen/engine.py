@@ -400,10 +400,12 @@ class Engine:
 
     def seed_shapes(self, shapes: list[Shape]) -> None:
         """Resume mode: replay shapes onto the canvas before generation starts."""
-        for s in shapes:
-            new_canvas, new_rms = composite(self.canvas, s, self.target, self.alpha_mask, self.edge_weight)
+        for i, s in enumerate(shapes):
+            compute_rms = (i == len(shapes) - 1)
+            new_canvas, new_rms = composite(self.canvas, s, self.target, self.alpha_mask, self.edge_weight, compute_rms=compute_rms)
             self.canvas[:] = new_canvas  # write into shared memory
-            self.rms = new_rms
+            if compute_rms:
+                self.rms = new_rms
             self.shapes.append(s)
 
     # Residual reblend disabled in v0.4.0 — the size-schedule + edge-weight
@@ -437,8 +439,10 @@ class Engine:
         tonal coverage) without exploding scoring cost at higher
         max_resolutions (4K / 8K targets).
         """
+        if progress < 0.05:
+            return 1.00        # 0-5%: ~100% canvas - for very large background fills
         if progress < 0.25:
-            return 0.30        # 0–25%: ~30% canvas — modest bump over legacy for tonal blocks
+            return 0.30        # 6–25%: ~30% canvas — modest bump over legacy for tonal blocks
         if progress < 0.50:
             return 0.22        # 26–50%: ~22% canvas
         if progress < 0.75:
@@ -508,7 +512,7 @@ class Engine:
         if self._backend == "pytorch" and self._gpu is not None:
             try:
                 # PyTorch backend needs to know which type to search for
-                self._gpu._current_type = types[0] if types else "rotated_ellipse"
+                self._gpu._current_types = types if types else ["rotated_ellipse"]
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
             except Exception as exc:
                 self._backend = "cpu"
@@ -529,14 +533,10 @@ class Engine:
         types = [t for t in p.shape_types if t]
         if not types:
             types = ["rotated_ellipse"]
-        # Per-iteration type rotation. Without this, every worker picks a type
-        # at random and ellipses (which fit organic content best) win the
-        # fitness comparison nearly every iteration, so checked rectangle /
-        # rotated_rectangle types produce zero shapes in the final JSON. With
-        # rotation, each iteration is locked to a single type so every
-        # checked type gets dedicated commit slots in proportion to how many
-        # types are enabled.
-        type_cursor = 0
+        # All shapes now compete fairly. The PyTorch backend generates the same starting
+        # coordinates for every shape type and lets them compete directly to find the
+        # absolute best fit for that coordinate, rather than forcing suboptimal shapes
+        # via round-robin rotation.
         save_at = set(p.save_at)
         # Tell the GUI which backend actually ran (status bar). `self._backend`
         # is the resolved/effective backend after any GPU build attempt.
@@ -551,8 +551,7 @@ class Engine:
                 while self._pause and not self._stop:
                     time.sleep(0.05)
 
-                iter_types = [types[type_cursor % len(types)]]
-                type_cursor += 1
+                iter_types = types
 
                 progress = len(self.shapes) / max(1, p.stop_at)
                 size_cap = self._max_size_frac_for_progress(progress)
@@ -606,9 +605,13 @@ class Engine:
 
                 # Commit. Update shared canvas in place so next iteration's
                 # workers see the new state on their next read.
-                new_canvas, new_rms = composite(self.canvas, refined, self.target, self.alpha_mask, self.edge_weight)
+                next_count = len(self.shapes) + 1
+                compute_rms = (next_count % max(1, p.lazy_error_every) == 0) or (next_count == p.stop_at)
+
+                new_canvas, new_rms = composite(self.canvas, refined, self.target, self.alpha_mask, self.edge_weight, compute_rms=compute_rms)
                 self.canvas[:] = new_canvas
-                self.rms = new_rms
+                if compute_rms:
+                    self.rms = new_rms
                 self.shapes.append(refined)
                 count = len(self.shapes)
 
