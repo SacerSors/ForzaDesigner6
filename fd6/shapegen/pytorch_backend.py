@@ -45,13 +45,11 @@ class PyTorchDiffRenderer:
         else:
             self.alpha_mask = torch.ones((self.h, self.w), dtype=torch.float32, device=self.device)
 
-        # Coordinate grid (H, W, 2)
-        y, x = torch.meshgrid(torch.arange(self.h, device=self.device),
-                              torch.arange(self.w, device=self.device), indexing='ij')
-        self.grid = torch.stack([x.float(), y.float()], dim=-1) # (H, W, 2)
+        # Precompute normalized grids for grid_sample
+        # F.grid_sample expects coordinates in [-1, 1] for (x, y)
 
     def _random_params(self, shape_type: str, b: int, w: int, h: int, max_size_frac: Optional[float], rng: random.Random) -> torch.Tensor:
-        """Generates random parameters for shapes. Parameters are initialized on CPU then moved to device."""
+        """Generates random parameters for shapes. Parameters are generated directly on the device."""
         if max_size_frac is None:
             rx_cap = max(2.0, w / 8.0)
             ry_cap = max(2.0, h / 8.0)
@@ -59,51 +57,57 @@ class PyTorchDiffRenderer:
             rx_cap = max(2.0, (w * max_size_frac) / 2.0)
             ry_cap = max(2.0, (h * max_size_frac) / 2.0)
 
-        rs = np.random.RandomState(rng.randint(0, 2**31 - 1))
+        # Seed PyTorch RNG based on Python's random state
+        seed = rng.randint(0, 2**31 - 1)
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(seed)
+
+        out = torch.empty((b, 5), dtype=torch.float32, device=self.device)
+
+        # Standard uniform macro: a + (b - a) * rand()
+        def uniform(idx, a, b_val):
+            out[:, idx] = a + (b_val - a) * torch.rand(b, generator=gen, device=self.device)
 
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
-            # params: cx, cy, rx, ry, angle_rad
-            out = np.empty((b, 5), dtype=np.float32)
-            out[:, 0] = rs.uniform(0, w - 1, b)
-            out[:, 1] = rs.uniform(0, h - 1, b)
-            out[:, 2] = rs.uniform(1, rx_cap, b)
-            out[:, 3] = rs.uniform(1, ry_cap if shape_type != "circle" else rx_cap, b)
-            out[:, 4] = rs.uniform(0, 2 * math.pi, b) if shape_type == "rotated_ellipse" else 0.0
+            uniform(0, 0, w - 1)
+            uniform(1, 0, h - 1)
+            uniform(2, 1, rx_cap)
+            uniform(3, 1, ry_cap if shape_type != "circle" else rx_cap)
+            if shape_type == "rotated_ellipse":
+                uniform(4, 0, 2 * math.pi)
+            else:
+                out[:, 4] = 0.0
 
         elif shape_type in ("rectangle", "rotated_rectangle"):
-            # params: cx, cy, rx (half-width), ry (half-height), angle_rad
-            out = np.empty((b, 5), dtype=np.float32)
-            out[:, 0] = rs.uniform(0, w - 1, b)
-            out[:, 1] = rs.uniform(0, h - 1, b)
-            out[:, 2] = rs.uniform(1, rx_cap, b)
-            out[:, 3] = rs.uniform(1, ry_cap, b)
-            out[:, 4] = rs.uniform(0, 2 * math.pi, b) if shape_type == "rotated_rectangle" else 0.0
+            uniform(0, 0, w - 1)
+            uniform(1, 0, h - 1)
+            uniform(2, 1, rx_cap)
+            uniform(3, 1, ry_cap)
+            if shape_type == "rotated_rectangle":
+                uniform(4, 0, 2 * math.pi)
+            else:
+                out[:, 4] = 0.0
 
         elif shape_type == "triangle":
-            # params: cx, cy, scale, angle_rad, aspect_ratio
-            out = np.empty((b, 5), dtype=np.float32)
-            out[:, 0] = rs.uniform(0, w - 1, b)
-            out[:, 1] = rs.uniform(0, h - 1, b)
-            out[:, 2] = rs.uniform(10, max(10, w * (max_size_frac or 0.25)), b) # scale
-            out[:, 3] = rs.uniform(0, 2 * math.pi, b) # angle
-            out[:, 4] = rs.uniform(0.5, 2.0, b) # aspect ratio
+            uniform(0, 0, w - 1)
+            uniform(1, 0, h - 1)
+            uniform(2, 10, max(10, w * (max_size_frac or 0.25)))
+            uniform(3, 0, 2 * math.pi)
+            uniform(4, 0.5, 2.0)
         else:
             raise ValueError(f"Unsupported shape type: {shape_type}")
 
-        return torch.from_numpy(out).to(self.device)
+        return out
 
     def _sdf_ellipse(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Approximate SDF for an ellipse.
         params: (B, 5) -> cx, cy, rx, ry, angle
-        p: (H, W, 2)
-        returns mask: (B, H, W)
+        p: (B, T, T, 2)
+        returns mask: (B, T, T)
         """
         B = params.shape[0]
         cx, cy, rx, ry, angle = params.unbind(dim=-1) # each (B,)
-
-        # Reshape for broadcasting: p is (H, W, 2) -> (1, H, W, 2)
-        p = p.unsqueeze(0)
 
         cos_a = torch.cos(angle).view(B, 1, 1)
         sin_a = torch.sin(angle).view(B, 1, 1)
@@ -131,12 +135,12 @@ class PyTorchDiffRenderer:
         """
         Exact SDF for a rectangle.
         params: (B, 5) -> cx, cy, rx (half-width), ry (half-height), angle
-        returns mask: (B, H, W)
+        p: (B, T, T, 2)
+        returns mask: (B, T, T)
         """
         B = params.shape[0]
         cx, cy, rx, ry, angle = params.unbind(dim=-1)
 
-        p = p.unsqueeze(0)
         cos_a = torch.cos(angle).view(B, 1, 1)
         sin_a = torch.sin(angle).view(B, 1, 1)
 
@@ -162,12 +166,12 @@ class PyTorchDiffRenderer:
         """
         Approximate SDF for an isosceles triangle pointing up.
         params: (B, 5) -> cx, cy, scale, angle, aspect
-        returns mask: (B, H, W)
+        p: (B, T, T, 2)
+        returns mask: (B, T, T)
         """
         B = params.shape[0]
         cx, cy, scale, angle, aspect = params.unbind(dim=-1)
 
-        p = p.unsqueeze(0)
         cos_a = torch.cos(angle).view(B, 1, 1)
         sin_a = torch.sin(angle).view(B, 1, 1)
 
@@ -203,26 +207,29 @@ class PyTorchDiffRenderer:
         mask = torch.sigmoid(-d_final * 10.0)
         return mask
 
-    def _get_mask(self, shape_type: str, params: torch.Tensor) -> torch.Tensor:
+    def _get_mask(self, shape_type: str, grid: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
-            return self._sdf_ellipse(self.grid, params)
+            return self._sdf_ellipse(grid, params)
         elif shape_type in ("rectangle", "rotated_rectangle"):
-            return self._sdf_rectangle(self.grid, params)
+            return self._sdf_rectangle(grid, params)
         elif shape_type == "triangle":
-            return self._sdf_triangle(self.grid, params)
+            return self._sdf_triangle(grid, params)
         else:
             raise ValueError(f"Unsupported shape type: {shape_type}")
 
-    def _score_and_color(self, canvas: torch.Tensor, mask: torch.Tensor, full_sq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _score_and_color(self, cur_t: torch.Tensor, tgt_t: torch.Tensor, alpha_t: torch.Tensor, edge_t: torch.Tensor, mask: torch.Tensor, full_sq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Computes score and optimal color for a batch of masks over the canvas.
-        mask: (B, H, W)
-        canvas: (H, W, 3)
+        Computes score and optimal color for a batch of masks over the LOCAL tiles.
+        mask: (B, T, T)
+        cur_t: (B, T, T, 3)
+        tgt_t: (B, T, T, 3)
+        alpha_t: (B, T, T)
+        edge_t: (B, T, T)
         returns scores: (B,), colors: (B, 3)
         """
         B = mask.shape[0]
 
-        eff = mask * self.alpha_mask.unsqueeze(0) # (B, H, W)
+        eff = mask * alpha_t # (B, T, T)
 
         a = _SEARCH_ALPHA
 
@@ -230,11 +237,8 @@ class PyTorchDiffRenderer:
         eff_sum = eff.sum(dim=(1, 2)) # (B,)
         denom = eff_sum * a
 
-        tgt = self.target.unsqueeze(0) # (1, H, W, 3)
-        cur = canvas.unsqueeze(0) # (1, H, W, 3)
-
         # numer = sum(eff * (tgt - (1-a)*cur))
-        diff = tgt - (1.0 - a) * cur # (1, H, W, 3)
+        diff = tgt_t - (1.0 - a) * cur_t # (B, T, T, 3)
         numer = (eff.unsqueeze(-1) * diff).sum(dim=(1, 2)) # (B, 3)
 
         safe = eff_sum > 0.5
@@ -243,13 +247,13 @@ class PyTorchDiffRenderer:
         color = torch.where(safe.unsqueeze(-1), torch.clamp(numer / denom_safe.unsqueeze(-1), 0.0, 1.0), torch.zeros_like(numer))
 
         # Blended image
-        m = mask.unsqueeze(-1) # (B, H, W, 1)
-        blended = m * (a * color.view(B, 1, 1, 3) + (1.0 - a) * cur) + (1.0 - m) * cur
+        m = mask.unsqueeze(-1) # (B, T, T, 1)
+        blended = m * (a * color.view(B, 1, 1, 3) + (1.0 - a) * cur_t) + (1.0 - m) * cur_t
 
-        w_t = self.edge_weight.unsqueeze(0).unsqueeze(-1) # (1, H, W, 1)
+        w_t = edge_t.unsqueeze(-1) # (B, T, T, 1)
 
-        region_old = (w_t * (cur - tgt)**2).sum(dim=(1, 2, 3)) # (B,)
-        region_new = (w_t * (blended - tgt)**2).sum(dim=(1, 2, 3)) # (B,)
+        region_old = (w_t * (cur_t - tgt_t)**2).sum(dim=(1, 2, 3)) # (B,)
+        region_new = (w_t * (blended - tgt_t)**2).sum(dim=(1, 2, 3)) # (B,)
 
         total = full_sq - region_old + region_new
 
@@ -259,7 +263,7 @@ class PyTorchDiffRenderer:
         # Sticker overlap rejection
         body = (mask >= 0.5).float()
         body_total = body.sum(dim=(1, 2))
-        opaque = ((self.alpha_mask.unsqueeze(0) >= 0.5) & (mask >= 0.5)).float().sum(dim=(1, 2))
+        opaque = ((alpha_t >= 0.5) & (mask >= 0.5)).float().sum(dim=(1, 2))
         ratio = torch.where(body_total >= 1.0, opaque / torch.clamp(body_total, min=1.0), torch.zeros_like(body_total))
         reject = (body_total < 1.0) | (ratio < 0.995)
 
@@ -267,13 +271,54 @@ class PyTorchDiffRenderer:
 
         return score, color
 
+    def _extract_tiles(self, params: torch.Tensor, cur_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extracts local cropped patches for each shape to prevent massive VRAM use.
+        Returns: grid (B, T, T, 2), cur_t, tgt_t, alpha_t, edge_t
+        """
+        B = params.shape[0]
+        # Calculate optimal tile size
+        max_r = torch.max(torch.maximum(params[:, 2], params[:, 3])).item() if B else 1.0
+        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(max_r) + 2)))
+
+        # Create un-normalized grid offsets
+        y_off, x_off = torch.meshgrid(torch.arange(T, device=self.device),
+                                      torch.arange(T, device=self.device), indexing='ij')
+
+        # Centers
+        cx = torch.round(params[:, 0]).long()
+        cy = torch.round(params[:, 1]).long()
+
+        x0 = cx - T // 2
+        y0 = cy - T // 2
+
+        # Global grid coordinates for each shape
+        gx = x0.view(B, 1, 1) + x_off.view(1, T, T)
+        gy = y0.view(B, 1, 1) + y_off.view(1, T, T)
+
+        valid = ((gx >= 0) & (gx < self.w) & (gy >= 0) & (gy < self.h)).float()
+
+        # Clamp to avoid out-of-bounds indexing (valid mask handles the edges)
+        gxc = torch.clamp(gx, 0, self.w - 1)
+        gyc = torch.clamp(gy, 0, self.h - 1)
+
+        # Gather local patches
+        cur_t = cur_tensor[gyc, gxc] # (B, T, T, 3)
+        tgt_t = self.target[gyc, gxc]
+        alpha_t = self.alpha_mask[gyc, gxc] * valid
+        edge_t = self.edge_weight[gyc, gxc] * valid
+
+        grid = torch.stack([gx.float(), gy.float()], dim=-1) # (B, T, T, 2)
+
+        return grid, cur_t, tgt_t, alpha_t, edge_t
+
     def search(self, canvas: np.ndarray, n_random: int, n_mutate: int, max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
         # Randomly select one shape type if multiple are given, but engine calls search with ONE type due to rotation
         shape_type = "rotated_ellipse" # default fallback
         if hasattr(self, '_current_type'):
             shape_type = self._current_type
 
-        cur_tensor = torch.from_numpy(np.array(canvas, copy=True)).float().to(self.device) / 255.0
+        cur_tensor = torch.from_numpy(np.array(canvas, copy=True)).float().to(self.device, non_blocking=True) / 255.0
 
         full_sq = (((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)).sum()
 
@@ -288,8 +333,10 @@ class PyTorchDiffRenderer:
         with torch.no_grad():
             for i in range(0, n_random, chunk_size):
                 p_chunk = params[i:i+chunk_size]
-                mask = self._get_mask(shape_type, p_chunk)
-                sc, col = self._score_and_color(cur_tensor, mask, full_sq)
+                grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles(p_chunk, cur_tensor)
+
+                mask = self._get_mask(shape_type, grid, p_chunk)
+                sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq)
                 scores_list.append(sc)
                 colors_list.append(col)
 
@@ -320,12 +367,15 @@ class PyTorchDiffRenderer:
         n_mutate = max(1, n_mutate)
         lr = 1.0
 
+        # We need to re-extract tiles for the top K before optimizing
+        grid_top, cur_t_top, tgt_t_top, alpha_t_top, edge_t_top = self._extract_tiles(top_params, cur_tensor)
+
         for _ in range(n_mutate):
             if top_params.grad is not None:
                 top_params.grad.zero_()
 
-            mask = self._get_mask(shape_type, top_params)
-            sc, col = self._score_and_color(cur_tensor, mask, full_sq)
+            mask = self._get_mask(shape_type, grid_top, top_params)
+            sc, col = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask, full_sq)
 
             # Loss is the mean of scores
             loss = sc.mean()
@@ -340,8 +390,8 @@ class PyTorchDiffRenderer:
 
             # Check if any score improved
             with torch.no_grad():
-                mask_eval = self._get_mask(shape_type, top_params)
-                sc_eval, col_eval = self._score_and_color(cur_tensor, mask_eval, full_sq)
+                mask_eval = self._get_mask(shape_type, grid_top, top_params)
+                sc_eval, col_eval = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq)
 
                 min_sc, min_idx = torch.min(sc_eval, dim=0)
                 if min_sc.item() < best_opt_score:
