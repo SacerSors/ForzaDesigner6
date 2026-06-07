@@ -355,7 +355,7 @@ class Engine:
             try:
                 if PyTorchDiffRenderer is None:
                     raise ImportError("PyTorchDiffRenderer could not be imported earlier.")
-                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight)
+                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight, lazy_error_every=p.lazy_error_every)
                 self._backend = "pytorch"
                 logger.warning("Engine init: PyTorchDiffRenderer instantiated successfully.")
             except Exception as exc:
