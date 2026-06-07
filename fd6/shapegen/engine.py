@@ -459,6 +459,7 @@ class Engine:
 
         final_shapes = []
         contribution_removed = 0
+        scored_shapes = []
 
         if self.alpha_mask is not None:
             mask3 = (self.alpha_mask > 0)[:, :, None]
@@ -499,12 +500,34 @@ class Engine:
                 contribution_removed += 1
                 continue
 
+            # Total color impact score (used for prune_to targeting)
+            impact_score = float(diff.sum())
+            scored_shapes.append((impact_score, idx, s))
+
             # If it contributed enough, we commit it to the running canvas
             running_canvas[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
             final_shapes.append(s)
 
-        if occlusion_removed > 0 or contribution_removed > 0:
-            logger.info(f"Pruned {occlusion_removed} occluded shapes and {contribution_removed} negligible shapes.")
+        # Pass 3: Aggressive Target Pruning
+        # If the user requested a hard cap (e.g., prune down to 2000 shapes), we delete the
+        # shapes with the lowest visual impact scores.
+        target_cap = getattr(self.profile, "prune_to", 0)
+        target_removed = 0
+
+        if target_cap > 0 and len(final_shapes) > target_cap:
+            # Sort by impact score descending (highest impact first)
+            scored_shapes.sort(key=lambda item: item[0], reverse=True)
+
+            # Keep only the top `target_cap` shapes
+            kept_scored_shapes = scored_shapes[:target_cap]
+            target_removed = len(final_shapes) - target_cap
+
+            # Re-sort by original index to maintain the correct draw order (Z-index)
+            kept_scored_shapes.sort(key=lambda item: item[1])
+            final_shapes = [item[2] for item in kept_scored_shapes]
+
+        if occlusion_removed > 0 or contribution_removed > 0 or target_removed > 0:
+            logger.info(f"Pruned {occlusion_removed} occluded, {contribution_removed} negligible, and {target_removed} target-cap shapes.")
 
         self.shapes = final_shapes
 
