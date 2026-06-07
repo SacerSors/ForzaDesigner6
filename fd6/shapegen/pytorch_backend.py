@@ -405,20 +405,25 @@ class PyTorchDiffRenderer:
         c_np = (best_opt_color.cpu().numpy() * 255.0).astype(np.int32)
         color_tuple = (int(c_np[0]), int(c_np[1]), int(c_np[2]), int(_SEARCH_ALPHA * 255))
 
-        cx, cy = p_np[0], p_np[1]
+        # Cast to standard python floats to avoid JSON serialization errors
+        cx, cy = float(p_np[0]), float(p_np[1])
 
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
-            rx, ry, angle = p_np[2], p_np[3], p_np[4]
+            rx, ry, angle = float(p_np[2]), float(p_np[3]), float(p_np[4])
             deg = math.degrees(angle) % 180.0
             return best_opt_score, RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=rx, ry=ry, angle=deg)
 
         elif shape_type in ("rectangle", "rotated_rectangle"):
-            rx, ry, angle = p_np[2], p_np[3], p_np[4]
+            from fd6.shapegen.shapes.rectangle import RotatedRectangle
+            rx, ry, angle = float(p_np[2]), float(p_np[3]), float(p_np[4])
             deg = math.degrees(angle) % 180.0
-            return best_opt_score, Rectangle(color=color_tuple, x=cx, y=cy, rx=rx, ry=ry, angle=deg)
+            if shape_type == "rotated_rectangle":
+                return best_opt_score, RotatedRectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry, angle=deg)
+            else:
+                return best_opt_score, Rectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry)
 
         elif shape_type == "triangle":
-            scale, angle, aspect = p_np[2], p_np[3], p_np[4]
+            scale, angle, aspect = float(p_np[2]), float(p_np[3]), float(p_np[4])
             deg = math.degrees(angle) % 360.0
             h = scale * aspect
             # For compatibility with legacy Triangle (usually defined by 3 points), we could return a specific triangle

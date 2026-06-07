@@ -508,7 +508,7 @@ class Engine:
         if self._backend == "pytorch" and self._gpu is not None:
             try:
                 # PyTorch backend needs to know which type to search for
-                self._gpu._current_type = self.profile.shape_types[0] if self.profile.shape_types else "rotated_ellipse"
+                self._gpu._current_type = types[0] if types else "rotated_ellipse"
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
             except Exception as exc:
                 self._backend = "cpu"
