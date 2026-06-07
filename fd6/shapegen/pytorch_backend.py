@@ -27,7 +27,11 @@ class PyTorchDiffRenderer:
     using the Adam optimizer with an edge-weighted MSE loss over SDFs.
     """
 
-    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray) -> None:
+    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray, lazy_error_every: int = 10) -> None:
+        self.lazy_error_every = lazy_error_every
+        self._err_cx_cache = None
+        self._err_cy_cache = None
+        self._err_cache_idx = 0
         if torch is None:
             raise RuntimeError("PyTorch is not available.")
 
@@ -77,14 +81,23 @@ class PyTorchDiffRenderer:
 
             if num_err > 0:
                 # Error-oriented locations using multinomial sampling on edge_weight
-                flat_weights = self.edge_weight.flatten()
-                if flat_weights.sum() > 0:
-                    indices = torch.multinomial(flat_weights, num_err, replacement=True, generator=gen)
-                    err_cx = (indices % w).float()
-                    err_cy = torch.div(indices, w, rounding_mode='floor').float()
-                else:
-                    err_cx = (w - 1) * torch.rand(num_err, generator=gen, device=self.device)
-                    err_cy = (h - 1) * torch.rand(num_err, generator=gen, device=self.device)
+                # Lazy calculation: only recompute the multinomial every lazy_error_every calls
+                if self._err_cx_cache is None or self._err_cache_idx >= self.lazy_error_every:
+                    flat_weights = self.edge_weight.flatten()
+                    if flat_weights.sum() > 0:
+                        needed_samples = num_err * self.lazy_error_every
+                        indices = torch.multinomial(flat_weights, needed_samples, replacement=True, generator=gen)
+                        self._err_cx_cache = (indices % w).float().view(self.lazy_error_every, num_err)
+                        self._err_cy_cache = torch.div(indices, w, rounding_mode='floor').float().view(self.lazy_error_every, num_err)
+                    else:
+                        self._err_cx_cache = (w - 1) * torch.rand(self.lazy_error_every, num_err, generator=gen, device=self.device)
+                        self._err_cy_cache = (h - 1) * torch.rand(self.lazy_error_every, num_err, generator=gen, device=self.device)
+                    self._err_cache_idx = 0
+
+                err_cx = self._err_cx_cache[self._err_cache_idx]
+                err_cy = self._err_cy_cache[self._err_cache_idx]
+                self._err_cache_idx += 1
+
                 out[:, 0] = torch.cat([err_cx, rnd_cx])
                 out[:, 1] = torch.cat([err_cy, rnd_cy])
             else:

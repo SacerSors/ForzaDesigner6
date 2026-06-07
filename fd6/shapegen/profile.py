@@ -17,6 +17,7 @@ class Profile:
     preview_every: int = 1
     random_samples: int = 1000
     redundant_check_every: int = 500
+    lazy_error_every: int = 10
     save_at: list[int] = field(default_factory=lambda: [500, 1000, 1500, 2000, 2500, 3000])
     save_every: int = 100
     stop_at: int = 3000
@@ -38,6 +39,7 @@ class Profile:
             "previewEvery": str(self.preview_every),
             "randomSamples": str(self.random_samples),
             "redundantCheckEvery": str(self.redundant_check_every),
+            "lazyErrorEvery": str(self.lazy_error_every),
             "saveAt": ",".join(str(s) for s in self.save_at),
             "saveEvery": str(self.save_every),
             "stopAt": str(self.stop_at),
@@ -87,6 +89,7 @@ def load_profile(name: str, text: str) -> Profile:
     p.preview_every = getint("previewEvery", p.preview_every)
     p.random_samples = getint("randomSamples", p.random_samples)
     p.redundant_check_every = getint("redundantCheckEvery", p.redundant_check_every)
+    p.lazy_error_every = getint("lazyErrorEvery", p.lazy_error_every)
     if "saveAt" in section:
         p.save_at = _parse_int_list(section["saveAt"])
     p.save_every = getint("saveEvery", p.save_every)
