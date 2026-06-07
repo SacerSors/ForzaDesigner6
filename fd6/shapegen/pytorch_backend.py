@@ -36,17 +36,19 @@ class PyTorchDiffRenderer:
         self.h, self.w = target.shape[:2]
         # Use np.array(copy=True) to avoid PyTorch warnings and potential segfaults
         # when converting read-only shared_memory buffers to tensors.
-        self.target = torch.from_numpy(np.array(target, copy=True)).float().to(self.device) / 255.0
-        self.edge_weight = torch.from_numpy(np.array(edge_weight, copy=True)).float().to(self.device)
+        # Transfer the uint8 array to device FIRST, then cast to float to save 75% PCIe bandwidth.
+        self.target = torch.from_numpy(np.array(target, copy=True)).to(self.device).float() / 255.0
+        self.edge_weight = torch.from_numpy(np.array(edge_weight, copy=True)).to(self.device).float()
         self.n_weight = float(self.edge_weight.sum().item()) * 3.0
 
         if alpha_mask is not None:
-            self.alpha_mask = torch.from_numpy(np.array(alpha_mask, copy=True)).float().to(self.device) / 255.0
+            self.alpha_mask = torch.from_numpy(np.array(alpha_mask, copy=True)).to(self.device).float() / 255.0
         else:
             self.alpha_mask = torch.ones((self.h, self.w), dtype=torch.float32, device=self.device)
 
         # Precompute normalized grids for grid_sample
         # F.grid_sample expects coordinates in [-1, 1] for (x, y)
+        self.generator = torch.Generator(device=self.device)
 
     def _random_params(self, shape_type: str, b: int, w: int, h: int, max_size_frac: Optional[float], rng: random.Random) -> torch.Tensor:
         """Generates random parameters for shapes. Parameters are generated directly on the device."""
@@ -59,14 +61,13 @@ class PyTorchDiffRenderer:
 
         # Seed PyTorch RNG based on Python's random state
         seed = rng.randint(0, 2**31 - 1)
-        gen = torch.Generator(device=self.device)
-        gen.manual_seed(seed)
+        self.generator.manual_seed(seed)
 
         out = torch.empty((b, 5), dtype=torch.float32, device=self.device)
 
         # Standard uniform macro: a + (b - a) * rand()
         def uniform(idx, a, b_val):
-            out[:, idx] = a + (b_val - a) * torch.rand(b, generator=gen, device=self.device)
+            out[:, idx] = a + (b_val - a) * torch.rand(b, generator=self.generator, device=self.device)
 
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
             uniform(0, 0, w - 1)
@@ -318,7 +319,8 @@ class PyTorchDiffRenderer:
         if hasattr(self, '_current_type'):
             shape_type = self._current_type
 
-        cur_tensor = torch.from_numpy(np.array(canvas, copy=True)).float().to(self.device, non_blocking=True) / 255.0
+        # Transfer 8-bit array to GPU first, then expand to 32-bit floats
+        cur_tensor = torch.from_numpy(np.array(canvas, copy=True)).to(self.device, non_blocking=True).float() / 255.0
 
         full_sq = (((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)).sum()
 
@@ -377,6 +379,16 @@ class PyTorchDiffRenderer:
             mask = self._get_mask(shape_type, grid_top, top_params)
             sc, col = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask, full_sq)
 
+            # Check if any score improved *before* taking the step.
+            # This eliminates the need for a secondary evaluation forward pass.
+            with torch.no_grad():
+                min_sc, min_idx = torch.min(sc, dim=0)
+                if min_sc.item() < best_opt_score:
+                    best_opt_score = min_sc.item()
+                    best_idx = min_idx.item()
+                    best_opt_params = top_params[best_idx].detach().clone()
+                    best_opt_color = col[best_idx].detach().clone()
+
             # Loss is the mean of scores
             loss = sc.mean()
             if not math.isfinite(loss.item()):
@@ -387,18 +399,6 @@ class PyTorchDiffRenderer:
             # Manual SGD step
             with torch.no_grad():
                 top_params -= lr * top_params.grad
-
-            # Check if any score improved
-            with torch.no_grad():
-                mask_eval = self._get_mask(shape_type, grid_top, top_params)
-                sc_eval, col_eval = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq)
-
-                min_sc, min_idx = torch.min(sc_eval, dim=0)
-                if min_sc.item() < best_opt_score:
-                    best_opt_score = min_sc.item()
-                    best_idx = min_idx.item()
-                    best_opt_params = top_params[best_idx].detach().clone()
-                    best_opt_color = col_eval[best_idx].detach().clone()
 
         # 4. Construct output shape
         p_np = best_opt_params.cpu().numpy()
