@@ -135,6 +135,12 @@ class SettingsPanel(QWidget):
             "10 = redraw every 10 shapes (faster, choppier). Doesn't affect "
             "the final result, only what you see while it's running."
         )
+        self.lazy_error_every = QSpinBox(); self.lazy_error_every.setRange(1, 1000); self.lazy_error_every.setValue(10)
+        self.lazy_error_every.setToolTip(
+            "Lazy error map evaluation. Instead of calculating the global target error map "
+            "after every shape (which can be very slow at high resolutions), it is calculated "
+            "every N shapes. 1 = exact calculation (safest but slowest), 10 = fast default."
+        )
         # QFormLayout auto-creates QLabel widgets for the left column. Those
         # labels do NOT inherit tooltips from their paired field, so hovering
         # the text "Stop at shapes" would show nothing. Create the labels
@@ -146,6 +152,7 @@ class SettingsPanel(QWidget):
             ("Max resolution (px)", self.max_resolution),
             ("Threads (0=auto)", self.max_threads),
             ("Preview every N", self.preview_every),
+            ("Lazy error every N", self.lazy_error_every),
         ):
             row_label = QLabel(label_text, adv)
             row_label.setToolTip(field.toolTip())
@@ -313,7 +320,7 @@ class SettingsPanel(QWidget):
         except Exception:
             return
         # Mirror into advanced widgets without re-emitting per-spinbox.
-        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
+        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every, self.lazy_error_every):
             w.blockSignals(True)
         self.stop_at.setValue(prof.stop_at)
         self.random_samples.setValue(prof.random_samples)
@@ -321,7 +328,8 @@ class SettingsPanel(QWidget):
         self.max_resolution.setValue(prof.max_resolution)
         self.max_threads.setValue(prof.max_threads)
         self.preview_every.setValue(prof.preview_every)
-        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
+        self.lazy_error_every.setValue(prof.lazy_error_every)
+        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every, self.lazy_error_every):
             w.blockSignals(False)
         for code, cb in self._shape_checks.items():
             cb.blockSignals(True)
@@ -361,6 +369,7 @@ class SettingsPanel(QWidget):
         base.max_resolution = self.max_resolution.value()
         base.max_threads = self.max_threads.value()
         base.preview_every = self.preview_every.value()
+        base.lazy_error_every = self.lazy_error_every.value()
         base.shape_types = [code for code, cb in self._shape_checks.items() if cb.isChecked()] or ["rotated_ellipse"]
         base.compute_backend = str(self.compute_backend.currentData() or "auto")
         return base

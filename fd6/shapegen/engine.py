@@ -400,10 +400,12 @@ class Engine:
 
     def seed_shapes(self, shapes: list[Shape]) -> None:
         """Resume mode: replay shapes onto the canvas before generation starts."""
-        for s in shapes:
-            new_canvas, new_rms = composite(self.canvas, s, self.target, self.alpha_mask, self.edge_weight)
+        for i, s in enumerate(shapes):
+            compute_rms = (i == len(shapes) - 1)
+            new_canvas, new_rms = composite(self.canvas, s, self.target, self.alpha_mask, self.edge_weight, compute_rms=compute_rms)
             self.canvas[:] = new_canvas  # write into shared memory
-            self.rms = new_rms
+            if compute_rms:
+                self.rms = new_rms
             self.shapes.append(s)
 
     # Residual reblend disabled in v0.4.0 — the size-schedule + edge-weight
@@ -603,9 +605,13 @@ class Engine:
 
                 # Commit. Update shared canvas in place so next iteration's
                 # workers see the new state on their next read.
-                new_canvas, new_rms = composite(self.canvas, refined, self.target, self.alpha_mask, self.edge_weight)
+                next_count = len(self.shapes) + 1
+                compute_rms = (next_count % max(1, p.lazy_error_every) == 0) or (next_count == p.stop_at)
+
+                new_canvas, new_rms = composite(self.canvas, refined, self.target, self.alpha_mask, self.edge_weight, compute_rms=compute_rms)
                 self.canvas[:] = new_canvas
-                self.rms = new_rms
+                if compute_rms:
+                    self.rms = new_rms
                 self.shapes.append(refined)
                 count = len(self.shapes)
 

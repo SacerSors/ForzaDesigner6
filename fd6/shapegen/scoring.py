@@ -137,18 +137,21 @@ def composite(
     target: np.ndarray,
     alpha_mask: np.ndarray | None = None,
     edge_weight: np.ndarray | None = None,
+    compute_rms: bool = True,
 ) -> tuple[np.ndarray, float]:
     """Composite shape over current canvas with optimal color. Return (new_canvas, new_rms).
 
     In sticker mode (alpha_mask provided), the shape's per-pixel mask is AND-ed with the
     target's alpha mask so paint never lands in transparent areas — the dark-grey canvas
     background stays visible there, which is what the user expects from sticker mode.
+
+    If `compute_rms` is False, skipping the expensive `rms_error` global calculation, returning 0.0.
     """
     h, w = current.shape[:2]
     mask_local, bbox = shape.rasterize_mask(w, h)
     x0, y0, x1, y1 = bbox
     if x1 <= x0 or y1 <= y0 or mask_local.size == 0:
-        return current, rms_error(current, target, alpha_mask)
+        return current, rms_error(current, target, alpha_mask) if compute_rms else 0.0
     # Combine shape mask with alpha mask if in sticker mode
     if alpha_mask is not None:
         region_alpha = alpha_mask[y0:y1, x0:x1]
@@ -165,7 +168,7 @@ def composite(
     blended = m * (a * region_tgt_color + (1.0 - a) * region_cur) + (1.0 - m) * region_cur
     new[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
     shape.color = color
-    return new, rms_error(new, target, alpha_mask, edge_weight)
+    return new, rms_error(new, target, alpha_mask, edge_weight) if compute_rms else 0.0
 
 
 # In sticker mode, virtually every "solid" pixel of a candidate shape must sit
