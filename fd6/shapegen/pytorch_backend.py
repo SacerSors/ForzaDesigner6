@@ -392,6 +392,14 @@ class PyTorchDiffRenderer:
         overall_best_color = None
         overall_best_type = None
 
+        # Calculate max bounds so the optimizer doesn't blow shapes up massively
+        if max_size_frac is None:
+            rx_cap = max(2.0, self.w / 8.0)
+            ry_cap = max(2.0, self.h / 8.0)
+        else:
+            rx_cap = max(2.0, (self.w * max_size_frac) / 2.0)
+            ry_cap = max(2.0, (self.h * max_size_frac) / 2.0)
+
         # Evenly divide random samples among the available shape types so that each place
         # isn't just randomly assigned a type, but rather we try all active shape types
         # across the batches and let them compete for the best score.
@@ -468,6 +476,14 @@ class PyTorchDiffRenderer:
                     v_hat = v / (1 - beta2 ** t)
 
                     top_params -= lr * m_hat / (torch.sqrt(v_hat) + eps)
+
+                    # Clamp scale parameters so the optimizer cannot inflate tiny
+                    # shapes into massive blocks near the end of generation.
+                    if shape_type in ("rotated_ellipse", "ellipse", "circle", "rectangle", "rotated_rectangle"):
+                        top_params[:, 2] = torch.clamp(top_params[:, 2], 1.0, rx_cap)
+                        top_params[:, 3] = torch.clamp(top_params[:, 3], 1.0, ry_cap)
+                    elif shape_type == "triangle":
+                        top_params[:, 2] = torch.clamp(top_params[:, 2], 10.0, max(10.0, self.w * (max_size_frac or 0.25)))
 
                 with torch.no_grad():
                     mask_eval = self._get_mask(shape_type, grid_top, top_params)
