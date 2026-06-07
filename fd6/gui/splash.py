@@ -131,12 +131,13 @@ class SplashWindow(QWidget):
             self._duration_timer.start(dur_ms + DURATION_BUFFER_MS)
 
     def _on_status(self, status) -> None:
+        # Avoid casting enums to int as PySide6 >= 6.4 removed int casting for strict enums
         try:
-            end_value = int(QMediaPlayer.MediaStatus.EndOfMedia)
+            if status == QMediaPlayer.MediaStatus.EndOfMedia:
+                self._emit_finished()
         except AttributeError:
-            end_value = int(QMediaPlayer.EndOfMedia)
-        if int(status) == end_value:
-            self._emit_finished()
+            if status == getattr(QMediaPlayer, "EndOfMedia", None):
+                self._emit_finished()
 
     def _on_position(self, pos_ms: int) -> None:
         dur = self.player.duration()

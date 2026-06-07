@@ -4,14 +4,23 @@ from dataclasses import dataclass
 from typing import Iterable
 import ctypes
 import os
+import logging
 import random
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 from multiprocessing import shared_memory
 
 import numpy as np
 from concurrent.futures.process import BrokenProcessPool
+
+try:
+    from fd6.shapegen.pytorch_backend import PyTorchDiffRenderer
+except ImportError:
+    PyTorchDiffRenderer = None
 
 from fd6.shapegen.profile import Profile
 from fd6.shapegen.scoring import (
@@ -123,6 +132,25 @@ _W_CANVAS_SHM: shared_memory.SharedMemory | None = None
 _W_CANVAS: np.ndarray | None = None
 
 
+def _cleanup_worker_shm() -> None:
+    """Explicitly close and unregister shared memory in worker processes to avoid segfaults."""
+    global _W_EDGE_SHM, _W_CANVAS_SHM
+    from multiprocessing.resource_tracker import unregister
+
+    if _W_EDGE_SHM is not None:
+        try:
+            _W_EDGE_SHM.close()
+            unregister(_W_EDGE_SHM._name, "shared_memory")
+        except Exception:
+            pass
+    if _W_CANVAS_SHM is not None:
+        try:
+            _W_CANVAS_SHM.close()
+            unregister(_W_CANVAS_SHM._name, "shared_memory")
+        except Exception:
+            pass
+
+
 def _init_worker(
     target_bytes: bytes, target_shape: tuple,
     canvas_shm_name: str, canvas_shape: tuple,
@@ -131,6 +159,8 @@ def _init_worker(
 ) -> None:
     """Subprocess startup hook. Wires up shared canvas + immutable target/alpha + LIVE edge weight."""
     global _W_TARGET, _W_ALPHA, _W_EDGE_WEIGHT, _W_EDGE_SHM, _W_CANVAS_SHM, _W_CANVAS
+    import atexit
+
     _W_TARGET = np.frombuffer(target_bytes, dtype=np.uint8).reshape(target_shape).copy()
     if alpha_bytes is not None and alpha_shape is not None:
         _W_ALPHA = np.frombuffer(alpha_bytes, dtype=np.uint8).reshape(alpha_shape).copy()
@@ -147,6 +177,8 @@ def _init_worker(
         _W_EDGE_WEIGHT = None
     _W_CANVAS_SHM = shared_memory.SharedMemory(name=canvas_shm_name)
     _W_CANVAS = np.ndarray(canvas_shape, dtype=np.uint8, buffer=_W_CANVAS_SHM.buf)
+
+    atexit.register(_cleanup_worker_shm)
 
 
 def _worker_independent_search(args: tuple) -> tuple:
@@ -308,8 +340,30 @@ class Engine:
         self._gpu_fallback_reason = ""
         self._backend_announced = "cpu"
         ellipse_only = all(t in ("rotated_ellipse", "ellipse") for t in (self.profile.shape_types or []))
-        requested = _gpu.resolve_backend(getattr(self.profile, "compute_backend", "auto"))
-        if requested == "gpu" and ellipse_only:
+
+        req_backend = getattr(self.profile, "compute_backend", "auto")
+        logger.warning(f"Engine init: resolved compute_backend requested from profile as '{req_backend}'")
+        if req_backend == "pytorch":
+            requested = "pytorch"
+        else:
+            requested = _gpu.resolve_backend(req_backend)
+
+        logger.warning(f"Engine init: finalized 'requested' backend is '{requested}'")
+
+        if requested == "pytorch":
+            logger.warning("Engine init: attempting to instantiate PyTorchDiffRenderer...")
+            try:
+                if PyTorchDiffRenderer is None:
+                    raise ImportError("PyTorchDiffRenderer could not be imported earlier.")
+                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight)
+                self._backend = "pytorch"
+                logger.warning("Engine init: PyTorchDiffRenderer instantiated successfully.")
+            except Exception as exc:
+                logger.error(f"Engine init: PyTorch backend init failed: {type(exc).__name__}: {exc}", exc_info=True)
+                self._gpu = None
+                self._backend = "cpu"
+                self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
+        elif requested == "gpu" and ellipse_only:
             try:
                 self._gpu = _gpu.OpenCLEllipseSearcher(self.target, self.alpha_mask, self.edge_weight)
                 self._backend = "gpu"
@@ -373,23 +427,22 @@ class Engine:
         boost = 1.0 + (self.RESIDUAL_BOOST - 1.0) * diff.astype(np.float32)
         self.edge_weight[:] = self._base_edge_weight * boost
 
-    def _max_size_frac_for_progress(self, progress: float) -> float:
-        """Shape-size schedule. Monotonically decreasing across iteration progress.
+    def _max_size_frac_for_progress(self, progress: float) -> tuple[float, float]:
+        """Shape-size schedule (min, max). Monotonically decreasing.
 
-        Per-candidate scoring cost is O(bbox_area) and bbox area scales with
-        `max_size_frac²`, so an early tier with `max_size_frac=1.0` (canvas-
-        spanning shapes) is ~16× more expensive than the legacy `0.25`
-        default. The values below keep T1 noticeably larger than legacy (for
-        tonal coverage) without exploding scoring cost at higher
-        max_resolutions (4K / 8K targets).
+        The first 5% of shapes are allowed to span the entire canvas to block
+        out massive background colors (e.g. skies, borders). Lower limits
+        ensure the engine doesn't waste early iterations on tiny details.
         """
+        if progress < 0.05:
+            return 0.20, 1.00  # 0-5%: Huge blockouts
         if progress < 0.25:
-            return 0.30        # 0–25%: ~30% canvas — modest bump over legacy for tonal blocks
+            return 0.05, 0.40  # 5-25%: Large shapes
         if progress < 0.50:
-            return 0.22        # 26–50%: ~22% canvas
+            return 0.02, 0.22  # 26-50%: Medium
         if progress < 0.75:
-            return 0.15        # 51–75%: ~15% canvas
-        return 0.10            # 76–100%: 10% canvas — fine detail only
+            return 0.01, 0.15  # 51-75%: Small
+        return 0.0, 0.10       # 76-100%: Fine detail
 
     def _parallel_search(self, types: list[str], n_random: int, n_mutate: int,
                          max_size_frac: float | None = None) -> tuple[float, Shape | None]:
@@ -444,14 +497,23 @@ class Engine:
         return best_score, best_shape
 
     def _search(self, types: list[str], n_random: int, n_mutate: int,
-                max_size_frac: float | None = None) -> tuple[float, Shape | None]:
+                min_size_frac: float = 0.0, max_size_frac: float | None = None) -> tuple[float, Shape | None]:
         """Dispatch one iteration's search to the active backend.
 
         GPU runs in the main process (one batched search). If a GPU op fails at
         runtime, we permanently fall back to the CPU pool for the rest of the run
         and record it so `run()` can tell the user via a backend event.
         """
-        if self._backend == "gpu" and self._gpu is not None:
+        if self._backend == "pytorch" and self._gpu is not None:
+            try:
+                # PyTorch backend needs to know which type to search for
+                self._gpu._current_type = types[0] if types else "rotated_ellipse"
+                return self._gpu.search(self.canvas, n_random, n_mutate, min_size_frac, max_size_frac, self.rng)
+            except Exception as exc:
+                self._backend = "cpu"
+                self._gpu = None
+                self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
+        elif self._backend == "gpu" and self._gpu is not None:
             try:
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
             except Exception as exc:
@@ -492,11 +554,17 @@ class Engine:
                 type_cursor += 1
 
                 progress = len(self.shapes) / max(1, p.stop_at)
-                size_cap = self._max_size_frac_for_progress(progress)
+
+                # Check if we should use the new min/max tuple (PyTorch mode mostly uses this)
+                size_res = self._max_size_frac_for_progress(progress)
+                if isinstance(size_res, tuple):
+                    min_cap, size_cap = size_res
+                else:
+                    min_cap, size_cap = 0.0, size_res
 
                 refined_score, refined = self._search(
                     iter_types, max(1, p.random_samples), max(1, p.mutated_samples),
-                    max_size_frac=size_cap,
+                    min_size_frac=min_cap, max_size_frac=size_cap,
                 )
                 # If the GPU degraded to CPU mid-run, announce the new backend once.
                 if self._backend != self._backend_announced:
@@ -516,7 +584,7 @@ class Engine:
                             break
                         refined_score, refined = self._search(
                             iter_types, max(1, p.random_samples), max(1, p.mutated_samples),
-                            max_size_frac=size_cap,
+                            min_size_frac=min_cap, max_size_frac=size_cap,
                         )
                         sticker_attempts += 1
                     else:
