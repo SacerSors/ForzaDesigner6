@@ -510,7 +510,7 @@ class Engine:
         if self._backend == "pytorch" and self._gpu is not None:
             try:
                 # PyTorch backend needs to know which type to search for
-                self._gpu._current_type = types[0] if types else "rotated_ellipse"
+                self._gpu._current_types = types if types else ["rotated_ellipse"]
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
             except Exception as exc:
                 self._backend = "cpu"
@@ -531,14 +531,10 @@ class Engine:
         types = [t for t in p.shape_types if t]
         if not types:
             types = ["rotated_ellipse"]
-        # Per-iteration type rotation. Without this, every worker picks a type
-        # at random and ellipses (which fit organic content best) win the
-        # fitness comparison nearly every iteration, so checked rectangle /
-        # rotated_rectangle types produce zero shapes in the final JSON. With
-        # rotation, each iteration is locked to a single type so every
-        # checked type gets dedicated commit slots in proportion to how many
-        # types are enabled.
-        type_cursor = 0
+        # All shapes now compete fairly. The PyTorch backend generates the same starting
+        # coordinates for every shape type and lets them compete directly to find the
+        # absolute best fit for that coordinate, rather than forcing suboptimal shapes
+        # via round-robin rotation.
         save_at = set(p.save_at)
         # Tell the GUI which backend actually ran (status bar). `self._backend`
         # is the resolved/effective backend after any GPU build attempt.
@@ -553,8 +549,7 @@ class Engine:
                 while self._pause and not self._stop:
                     time.sleep(0.05)
 
-                iter_types = [types[type_cursor % len(types)]]
-                type_cursor += 1
+                iter_types = types
 
                 progress = len(self.shapes) / max(1, p.stop_at)
                 size_cap = self._max_size_frac_for_progress(progress)

@@ -48,7 +48,7 @@ class PyTorchDiffRenderer:
         # Precompute normalized grids for grid_sample
         # F.grid_sample expects coordinates in [-1, 1] for (x, y)
 
-    def _random_params(self, shape_type: str, b: int, w: int, h: int, max_size_frac: Optional[float], rng: random.Random) -> torch.Tensor:
+    def _random_params(self, shape_type: str, b: int, w: int, h: int, max_size_frac: Optional[float], rng: random.Random, skip_locations: bool = False) -> torch.Tensor:
         """Generates random parameters for shapes. Parameters are generated directly on the device."""
         if max_size_frac is None:
             rx_cap = max(2.0, w / 8.0)
@@ -64,31 +64,32 @@ class PyTorchDiffRenderer:
 
         out = torch.empty((b, 5), dtype=torch.float32, device=self.device)
 
-        # Generate center coordinates (cx, cy)
-        # We place ~25% of shapes based on the error map (edge_weight) to focus on details,
-        # and ~75% uniformly at random to explore the canvas broadly.
-        num_err = b // 4
-        num_rnd = b - num_err
+        if not skip_locations:
+            # Generate center coordinates (cx, cy)
+            # We place ~25% of shapes based on the error map (edge_weight) to focus on details,
+            # and ~75% uniformly at random to explore the canvas broadly.
+            num_err = b // 4
+            num_rnd = b - num_err
 
-        # Uniform random locations
-        rnd_cx = (w - 1) * torch.rand(num_rnd, generator=gen, device=self.device)
-        rnd_cy = (h - 1) * torch.rand(num_rnd, generator=gen, device=self.device)
+            # Uniform random locations
+            rnd_cx = (w - 1) * torch.rand(num_rnd, generator=gen, device=self.device)
+            rnd_cy = (h - 1) * torch.rand(num_rnd, generator=gen, device=self.device)
 
-        if num_err > 0:
-            # Error-oriented locations using multinomial sampling on edge_weight
-            flat_weights = self.edge_weight.flatten()
-            if flat_weights.sum() > 0:
-                indices = torch.multinomial(flat_weights, num_err, replacement=True, generator=gen)
-                err_cx = (indices % w).float()
-                err_cy = torch.div(indices, w, rounding_mode='floor').float()
+            if num_err > 0:
+                # Error-oriented locations using multinomial sampling on edge_weight
+                flat_weights = self.edge_weight.flatten()
+                if flat_weights.sum() > 0:
+                    indices = torch.multinomial(flat_weights, num_err, replacement=True, generator=gen)
+                    err_cx = (indices % w).float()
+                    err_cy = torch.div(indices, w, rounding_mode='floor').float()
+                else:
+                    err_cx = (w - 1) * torch.rand(num_err, generator=gen, device=self.device)
+                    err_cy = (h - 1) * torch.rand(num_err, generator=gen, device=self.device)
+                out[:, 0] = torch.cat([err_cx, rnd_cx])
+                out[:, 1] = torch.cat([err_cy, rnd_cy])
             else:
-                err_cx = (w - 1) * torch.rand(num_err, generator=gen, device=self.device)
-                err_cy = (h - 1) * torch.rand(num_err, generator=gen, device=self.device)
-            out[:, 0] = torch.cat([err_cx, rnd_cx])
-            out[:, 1] = torch.cat([err_cy, rnd_cy])
-        else:
-            out[:, 0] = rnd_cx
-            out[:, 1] = rnd_cy
+                out[:, 0] = rnd_cx
+                out[:, 1] = rnd_cy
 
         # Standard uniform macro: a + (b - a) * rand()
         def uniform(idx, a, b_val):
@@ -336,138 +337,138 @@ class PyTorchDiffRenderer:
         return grid, cur_t, tgt_t, alpha_t, edge_t
 
     def search(self, canvas: np.ndarray, n_random: int, n_mutate: int, max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
-        # Randomly select one shape type if multiple are given, but engine calls search with ONE type due to rotation
-        shape_type = "rotated_ellipse" # default fallback
-        if hasattr(self, '_current_type'):
-            shape_type = self._current_type
+        shape_types = getattr(self, '_current_types', ["rotated_ellipse"])
+        if not shape_types:
+            shape_types = ["rotated_ellipse"]
 
         cur_tensor = torch.from_numpy(np.array(canvas, copy=True)).float().to(self.device, non_blocking=True) / 255.0
-
         full_sq = (((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)).sum()
-
-        # 1. Random Search via Forward Pass in chunks to prevent OOM
         n_random = max(1, n_random)
-        params = self._random_params(shape_type, n_random, self.w, self.h, max_size_frac, rng)
-
         chunk_size = 512
-        scores_list = []
-        colors_list = []
 
-        with torch.no_grad():
-            for i in range(0, n_random, chunk_size):
-                p_chunk = params[i:i+chunk_size]
-                grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles(p_chunk, cur_tensor)
+        global_best_score = float('inf')
+        global_best_shape = None
 
-                mask = self._get_mask(shape_type, grid, p_chunk)
-                sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq)
-                scores_list.append(sc)
-                colors_list.append(col)
+        # 1. Base (cx, cy) locations shared across all shapes
+        # We call _random_params with an arbitrary shape_type just to get the generic locations out
+        # Then we copy the cx, cy column for the others
+        base_params = self._random_params(shape_types[0], n_random, self.w, self.h, max_size_frac, rng)
+        base_cx = base_params[:, 0:1]
+        base_cy = base_params[:, 1:2]
 
-        all_scores = torch.cat(scores_list)
-        all_colors = torch.cat(colors_list)
+        for stype in shape_types:
+            # 2. Generate specific parameters attached to the shared (cx, cy)
+            params = self._random_params(stype, n_random, self.w, self.h, max_size_frac, rng, skip_locations=True)
+            params[:, 0:1] = base_cx
+            params[:, 1:2] = base_cy
 
-        # 2. Select top K candidates for optimization
-        K = min(16, n_random)
-        # Using torch.sort instead of torch.topk to avoid unsupported ops and fallback
-        sorted_scores, sorted_indices = torch.sort(all_scores)
-        top_indices = sorted_indices[:K]
+            scores_list = []
+            colors_list = []
 
-        best_score = sorted_scores[0].item()
-        if not math.isfinite(best_score):
-            return float('inf'), None
-
-        top_params = params[top_indices].clone().detach().requires_grad_(True)
-
-        # 3. Optimize top K candidates via Manual Adam Gradient Descent
-        # We manually update weights using the Adam algorithm formulas
-        # to avoid torch.optim.Adam segfaulting on ROCm inside a background QThread.
-
-        best_idx = 0
-        best_opt_score = best_score
-        best_opt_params = top_params[0].detach().clone()
-        best_opt_color = all_colors[top_indices[0]].detach().clone()
-
-        n_mutate = max(1, n_mutate)
-
-        # We need to re-extract tiles for the top K before optimizing
-        grid_top, cur_t_top, tgt_t_top, alpha_t_top, edge_t_top = self._extract_tiles(top_params, cur_tensor)
-
-        lr = 1.0
-        m = torch.zeros_like(top_params)
-        v = torch.zeros_like(top_params)
-        beta1 = 0.9
-        beta2 = 0.999
-        eps = 1e-8
-
-        for t in range(1, n_mutate + 1):
-            if top_params.grad is not None:
-                top_params.grad.zero_()
-
-            mask = self._get_mask(shape_type, grid_top, top_params)
-            sc, col = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask, full_sq)
-
-            # Loss is the mean of scores
-            loss = sc.mean()
-            if not math.isfinite(loss.item()):
-                break
-
-            loss.backward()
-
-            # Manual Adam step
             with torch.no_grad():
-                grad = top_params.grad
-                m = beta1 * m + (1 - beta1) * grad
-                v = beta2 * v + (1 - beta2) * (grad ** 2)
+                for i in range(0, n_random, chunk_size):
+                    p_chunk = params[i:i+chunk_size]
+                    grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles(p_chunk, cur_tensor)
 
-                m_hat = m / (1 - beta1 ** t)
-                v_hat = v / (1 - beta2 ** t)
+                    mask = self._get_mask(stype, grid, p_chunk)
+                    sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq)
+                    scores_list.append(sc)
+                    colors_list.append(col)
 
-                top_params -= lr * m_hat / (torch.sqrt(v_hat) + eps)
+            all_scores = torch.cat(scores_list)
+            all_colors = torch.cat(colors_list)
 
-            # Check if any score improved
-            with torch.no_grad():
-                mask_eval = self._get_mask(shape_type, grid_top, top_params)
-                sc_eval, col_eval = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq)
+            # 3. Select top K candidates for this shape type
+            K = min(16, n_random)
+            sorted_scores, sorted_indices = torch.sort(all_scores)
+            top_indices = sorted_indices[:K]
 
-                min_sc, min_idx = torch.min(sc_eval, dim=0)
-                if min_sc.item() < best_opt_score:
-                    best_opt_score = min_sc.item()
-                    best_idx = min_idx.item()
-                    best_opt_params = top_params[best_idx].detach().clone()
-                    best_opt_color = col_eval[best_idx].detach().clone()
+            best_score = sorted_scores[0].item()
+            if not math.isfinite(best_score):
+                continue
 
-        # 4. Construct output shape
-        p_np = best_opt_params.cpu().numpy()
-        c_np = (best_opt_color.cpu().numpy() * 255.0).astype(np.int32)
-        color_tuple = (int(c_np[0]), int(c_np[1]), int(c_np[2]), int(_SEARCH_ALPHA * 255))
+            top_params = params[top_indices].clone().detach().requires_grad_(True)
 
-        # Cast to standard python floats to avoid JSON serialization errors
-        cx, cy = float(p_np[0]), float(p_np[1])
+            best_idx = 0
+            best_opt_score = best_score
+            best_opt_params = top_params[0].detach().clone()
+            best_opt_color = all_colors[top_indices[0]].detach().clone()
 
-        if shape_type in ("rotated_ellipse", "ellipse", "circle"):
-            rx, ry, angle = float(p_np[2]), float(p_np[3]), float(p_np[4])
-            deg = math.degrees(angle) % 180.0
-            return best_opt_score, RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=rx, ry=ry, angle=deg)
+            n_mutate_loop = max(1, n_mutate)
 
-        elif shape_type in ("rectangle", "rotated_rectangle"):
-            from fd6.shapegen.shapes.rectangle import RotatedRectangle
-            rx, ry, angle = float(p_np[2]), float(p_np[3]), float(p_np[4])
-            deg = math.degrees(angle) % 180.0
-            if shape_type == "rotated_rectangle":
-                return best_opt_score, RotatedRectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry, angle=deg)
-            else:
-                return best_opt_score, Rectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry)
+            grid_top, cur_t_top, tgt_t_top, alpha_t_top, edge_t_top = self._extract_tiles(top_params, cur_tensor)
 
-        elif shape_type == "triangle":
-            scale, angle, aspect = float(p_np[2]), float(p_np[3]), float(p_np[4])
-            deg = math.degrees(angle) % 360.0
-            h = scale * aspect
-            # For compatibility with legacy Triangle (usually defined by 3 points), we could return a specific triangle
-            # but let's assume Triangle(color, x, y, scale, angle) for now or similar constructor
-            try:
-                return best_opt_score, Triangle(color=color_tuple, x=cx, y=cy, scale=scale, angle=deg, aspect=aspect)
-            except TypeError:
-                # If Triangle constructor is different, we fallback to RotatedEllipse
-                return best_opt_score, RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=scale, ry=h/2, angle=deg)
+            lr = 1.0
+            m = torch.zeros_like(top_params)
+            v = torch.zeros_like(top_params)
+            beta1 = 0.9
+            beta2 = 0.999
+            eps = 1e-8
 
-        return float('inf'), None
+            for t in range(1, n_mutate_loop + 1):
+                if top_params.grad is not None:
+                    top_params.grad.zero_()
+
+                mask = self._get_mask(stype, grid_top, top_params)
+                sc, col = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask, full_sq)
+
+                loss = sc.mean()
+                if not math.isfinite(loss.item()):
+                    break
+
+                loss.backward()
+
+                with torch.no_grad():
+                    grad = top_params.grad
+                    m = beta1 * m + (1 - beta1) * grad
+                    v = beta2 * v + (1 - beta2) * (grad ** 2)
+
+                    m_hat = m / (1 - beta1 ** t)
+                    v_hat = v / (1 - beta2 ** t)
+
+                    top_params -= lr * m_hat / (torch.sqrt(v_hat) + eps)
+
+                with torch.no_grad():
+                    mask_eval = self._get_mask(stype, grid_top, top_params)
+                    sc_eval, col_eval = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq)
+
+                    min_sc, min_idx = torch.min(sc_eval, dim=0)
+                    if min_sc.item() < best_opt_score:
+                        best_opt_score = min_sc.item()
+                        best_idx = min_idx.item()
+                        best_opt_params = top_params[best_idx].detach().clone()
+                        best_opt_color = col_eval[best_idx].detach().clone()
+
+            # 4. Construct output shape if it beats global best
+            if best_opt_score < global_best_score:
+                global_best_score = best_opt_score
+
+                p_np = best_opt_params.cpu().numpy()
+                c_np = (best_opt_color.cpu().numpy() * 255.0).astype(np.int32)
+                color_tuple = (int(c_np[0]), int(c_np[1]), int(c_np[2]), int(_SEARCH_ALPHA * 255))
+                cx, cy = float(p_np[0]), float(p_np[1])
+
+                if stype in ("rotated_ellipse", "ellipse", "circle"):
+                    rx, ry, angle = float(p_np[2]), float(p_np[3]), float(p_np[4])
+                    deg = math.degrees(angle) % 180.0
+                    global_best_shape = RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=rx, ry=ry, angle=deg)
+
+                elif stype in ("rectangle", "rotated_rectangle"):
+                    from fd6.shapegen.shapes.rectangle import RotatedRectangle
+                    rx, ry, angle = float(p_np[2]), float(p_np[3]), float(p_np[4])
+                    deg = math.degrees(angle) % 180.0
+                    if stype == "rotated_rectangle":
+                        global_best_shape = RotatedRectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry, angle=deg)
+                    else:
+                        global_best_shape = Rectangle(color=color_tuple, x=cx, y=cy, hw=rx, hh=ry)
+
+                elif stype == "triangle":
+                    scale, angle, aspect = float(p_np[2]), float(p_np[3]), float(p_np[4])
+                    deg = math.degrees(angle) % 360.0
+                    h_val = scale * aspect
+                    try:
+                        global_best_shape = Triangle(color=color_tuple, x=cx, y=cy, scale=scale, angle=deg, aspect=aspect)
+                    except TypeError:
+                        global_best_shape = RotatedEllipse(color=color_tuple, x=cx, y=cy, rx=scale, ry=h_val/2, angle=deg)
+
+        return global_best_score, global_best_shape
