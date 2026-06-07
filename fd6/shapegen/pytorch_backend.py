@@ -27,7 +27,7 @@ class PyTorchDiffRenderer:
     using the Adam optimizer with an edge-weighted MSE loss over SDFs.
     """
 
-    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray) -> None:
+    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray, edge_dir: Optional[np.ndarray] = None) -> None:
         if torch is None:
             raise RuntimeError("PyTorch is not available.")
 
@@ -39,6 +39,11 @@ class PyTorchDiffRenderer:
         self.target = torch.from_numpy(np.array(target, copy=True)).float().to(self.device) / 255.0
         self.edge_weight = torch.from_numpy(np.array(edge_weight, copy=True)).float().to(self.device)
         self.n_weight = float(self.edge_weight.sum().item()) * 3.0
+
+        if edge_dir is not None:
+            self.edge_dir = torch.from_numpy(np.array(edge_dir, copy=True)).float().to(self.device)
+        else:
+            self.edge_dir = torch.zeros((self.h, self.w), dtype=torch.float32, device=self.device)
 
         if alpha_mask is not None:
             self.alpha_mask = torch.from_numpy(np.array(alpha_mask, copy=True)).float().to(self.device) / 255.0
@@ -62,7 +67,7 @@ class PyTorchDiffRenderer:
         gen = torch.Generator(device=self.device)
         gen.manual_seed(seed)
 
-        out = torch.empty((b, 5), dtype=torch.float32, device=self.device)
+        out = torch.empty((b, 6), dtype=torch.float32, device=self.device)
 
         # 25% error-weighted placement
         b_err = int(b * 0.25)
@@ -90,11 +95,18 @@ class PyTorchDiffRenderer:
         def uniform(idx, a, b_val):
             out[:, idx] = a + (b_val - a) * torch.rand(b, generator=gen, device=self.device)
 
+        # Optimizable Opacity initialization:
+        # Start random alpha between 0.1 and 1.0
+        uniform(5, 0.1, 1.0)
+
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap if shape_type != "circle" else rx_cap)
             if shape_type == "rotated_ellipse":
-                uniform(4, 0, 2 * math.pi)
+                # Edge-Aligned Spawning
+                cx = torch.clamp(out[:, 0].long(), 0, w - 1)
+                cy = torch.clamp(out[:, 1].long(), 0, h - 1)
+                out[:, 4] = self.edge_dir[cy, cx]
             else:
                 out[:, 4] = 0.0
 
@@ -102,13 +114,19 @@ class PyTorchDiffRenderer:
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap)
             if shape_type == "rotated_rectangle":
-                uniform(4, 0, 2 * math.pi)
+                # Edge-Aligned Spawning
+                cx = torch.clamp(out[:, 0].long(), 0, w - 1)
+                cy = torch.clamp(out[:, 1].long(), 0, h - 1)
+                out[:, 4] = self.edge_dir[cy, cx]
             else:
                 out[:, 4] = 0.0
 
         elif shape_type == "triangle":
             uniform(2, 10, max(10, w * (max_size_frac or 0.25)))
-            uniform(3, 0, 2 * math.pi)
+            # Edge-Aligned Spawning
+            cx = torch.clamp(out[:, 0].long(), 0, w - 1)
+            cy = torch.clamp(out[:, 1].long(), 0, h - 1)
+            out[:, 3] = self.edge_dir[cy, cx]
             uniform(4, 0.5, 2.0)
         else:
             raise ValueError(f"Unsupported shape type: {shape_type}")
@@ -118,12 +136,12 @@ class PyTorchDiffRenderer:
     def _sdf_ellipse(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Approximate SDF for an ellipse.
-        params: (B, 5) -> cx, cy, rx, ry, angle
+        params: (B, 6) -> cx, cy, rx, ry, angle, alpha
         p: (B, T, T, 2)
         returns mask: (B, T, T)
         """
         B = params.shape[0]
-        cx, cy, rx, ry, angle = params.unbind(dim=-1) # each (B,)
+        cx, cy, rx, ry, angle, alpha = params.unbind(dim=-1) # each (B,)
 
         cos_a = torch.cos(angle).view(B, 1, 1)
         sin_a = torch.sin(angle).view(B, 1, 1)
@@ -151,12 +169,12 @@ class PyTorchDiffRenderer:
     def _sdf_rectangle(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Exact SDF for a rectangle.
-        params: (B, 5) -> cx, cy, rx (half-width), ry (half-height), angle
+        params: (B, 6) -> cx, cy, rx (half-width), ry (half-height), angle, alpha
         p: (B, T, T, 2)
         returns mask: (B, T, T)
         """
         B = params.shape[0]
-        cx, cy, rx, ry, angle = params.unbind(dim=-1)
+        cx, cy, rx, ry, angle, alpha = params.unbind(dim=-1)
 
         cos_a = torch.cos(angle).view(B, 1, 1)
         sin_a = torch.sin(angle).view(B, 1, 1)
@@ -183,12 +201,12 @@ class PyTorchDiffRenderer:
     def _sdf_triangle(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Approximate SDF for an isosceles triangle pointing up.
-        params: (B, 5) -> cx, cy, scale, angle, aspect
+        params: (B, 6) -> cx, cy, scale, angle, aspect, alpha
         p: (B, T, T, 2)
         returns mask: (B, T, T)
         """
         B = params.shape[0]
-        cx, cy, scale, angle, aspect = params.unbind(dim=-1)
+        cx, cy, scale, angle, aspect, alpha = params.unbind(dim=-1)
 
         cos_a = torch.cos(angle).view(B, 1, 1)
         sin_a = torch.sin(angle).view(B, 1, 1)
@@ -236,7 +254,7 @@ class PyTorchDiffRenderer:
         else:
             raise ValueError(f"Unsupported shape type: {shape_type}")
 
-    def _score_and_color(self, cur_t: torch.Tensor, tgt_t: torch.Tensor, alpha_t: torch.Tensor, edge_t: torch.Tensor, mask: torch.Tensor, full_sq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _score_and_color(self, cur_t: torch.Tensor, tgt_t: torch.Tensor, alpha_t: torch.Tensor, edge_t: torch.Tensor, mask: torch.Tensor, full_sq: torch.Tensor, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Computes score and optimal color for a batch of masks over the LOCAL tiles.
         mask: (B, T, T)
@@ -244,20 +262,24 @@ class PyTorchDiffRenderer:
         tgt_t: (B, T, T, 3)
         alpha_t: (B, T, T)
         edge_t: (B, T, T)
+        params: (B, 6)
         returns scores: (B,), colors: (B, 3)
         """
         B = mask.shape[0]
 
         eff = mask * alpha_t # (B, T, T)
 
-        a = _SEARCH_ALPHA
+        # Dynamic Alpha from params, clamped to [0.01, 1.0] to prevent div-by-zero
+        a = torch.clamp(params[:, 5], 0.01, 1.0)
+
+        a_view = a.view(B, 1, 1)
 
         # Optimal color
         eff_sum = eff.sum(dim=(1, 2)) # (B,)
         denom = eff_sum * a
 
         # numer = sum(eff * (tgt - (1-a)*cur))
-        diff = tgt_t - (1.0 - a) * cur_t # (B, T, T, 3)
+        diff = tgt_t - (1.0 - a_view).unsqueeze(-1) * cur_t # (B, T, T, 3)
         numer = (eff.unsqueeze(-1) * diff).sum(dim=(1, 2)) # (B, 3)
 
         safe = eff_sum > 0.5
@@ -267,7 +289,8 @@ class PyTorchDiffRenderer:
 
         # Blended image
         m = mask.unsqueeze(-1) # (B, T, T, 1)
-        blended = m * (a * color.view(B, 1, 1, 3) + (1.0 - a) * cur_t) + (1.0 - m) * cur_t
+        a_view_4 = a.view(B, 1, 1, 1)
+        blended = m * (a_view_4 * color.view(B, 1, 1, 3) + (1.0 - a_view_4) * cur_t) + (1.0 - m) * cur_t
 
         w_t = edge_t.unsqueeze(-1) # (B, T, T, 1)
 
@@ -386,7 +409,7 @@ class PyTorchDiffRenderer:
                     grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles(p_chunk, cur_tensor)
 
                     mask = self._get_mask(shape_type, grid, p_chunk)
-                    sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq)
+                    sc, col = self._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq, p_chunk)
                     scores_list.append(sc)
                     colors_list.append(col)
 
@@ -414,7 +437,6 @@ class PyTorchDiffRenderer:
 
             grid_top, cur_t_top, tgt_t_top, alpha_t_top, edge_t_top = self._extract_tiles(top_params, cur_tensor)
 
-            lr = 1.0
             m = torch.zeros_like(top_params)
             v = torch.zeros_like(top_params)
             beta1 = 0.9
@@ -422,11 +444,14 @@ class PyTorchDiffRenderer:
             eps = 1e-8
 
             for t in range(1, n_mutate + 1):
+                # Learning Rate Decay (Idea C): Linearly scale from 1.0 down to 0.1
+                lr = 1.0 - (0.9 * ((t - 1) / max(1, n_mutate - 1)))
+
                 if top_params.grad is not None:
                     top_params.grad.zero_()
 
                 mask = self._get_mask(shape_type, grid_top, top_params)
-                sc, col = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask, full_sq)
+                sc, col = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask, full_sq, top_params)
 
                 loss = sc.mean()
                 if not math.isfinite(loss.item()):
@@ -446,7 +471,7 @@ class PyTorchDiffRenderer:
 
                 with torch.no_grad():
                     mask_eval = self._get_mask(shape_type, grid_top, top_params)
-                    sc_eval, col_eval = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq)
+                    sc_eval, col_eval = self._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq, top_params)
 
                     min_sc, min_idx = torch.min(sc_eval, dim=0)
                     if min_sc.item() < best_opt_score:
@@ -468,7 +493,8 @@ class PyTorchDiffRenderer:
         # Construct output shape from overall best
         p_np = overall_best_params.cpu().numpy()
         c_np = (overall_best_color.cpu().numpy() * 255.0).astype(np.int32)
-        color_tuple = (int(c_np[0]), int(c_np[1]), int(c_np[2]), int(_SEARCH_ALPHA * 255))
+        final_alpha = int(max(0.01, min(1.0, float(p_np[5]))) * 255.0)
+        color_tuple = (int(c_np[0]), int(c_np[1]), int(c_np[2]), final_alpha)
 
         cx, cy = float(p_np[0]), float(p_np[1])
 
