@@ -128,7 +128,8 @@ class PyTorchDiffRenderer:
 
         # Soft mask: inside is positive, outside is negative in d. Actually d < 0 inside.
         # We want mask ~ 1 inside, 0 outside.
-        mask = torch.sigmoid(-d * 5.0) # Multiply by 5 for sharper edge
+        # Increased multiplier from 5.0 to 100.0 to match OpenCL hard-edge scoring closer
+        mask = torch.sigmoid(-d * 100.0)
         return mask
 
     def _sdf_rectangle(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
@@ -159,7 +160,8 @@ class PyTorchDiffRenderer:
         d = torch.maximum(d_max, torch.zeros_like(d_max)) + torch.min(d_max, torch.zeros_like(d_max))
 
         # Soft mask
-        mask = torch.sigmoid(-d * 2.0)
+        # Increased multiplier to match OpenCL hard-edge scoring closer
+        mask = torch.sigmoid(-d * 50.0)
         return mask
 
     def _sdf_triangle(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
@@ -204,7 +206,8 @@ class PyTorchDiffRenderer:
 
         d_final = torch.maximum(d, d_bottom)
 
-        mask = torch.sigmoid(-d_final * 10.0)
+        # Increased multiplier to match OpenCL hard-edge scoring closer
+        mask = torch.sigmoid(-d_final * 50.0)
         return mask
 
     def _get_mask(self, shape_type: str, grid: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
