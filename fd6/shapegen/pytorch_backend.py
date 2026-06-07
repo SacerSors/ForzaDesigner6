@@ -64,13 +64,37 @@ class PyTorchDiffRenderer:
 
         out = torch.empty((b, 5), dtype=torch.float32, device=self.device)
 
+        # Generate center coordinates (cx, cy)
+        # We place ~25% of shapes based on the error map (edge_weight) to focus on details,
+        # and ~75% uniformly at random to explore the canvas broadly.
+        num_err = b // 4
+        num_rnd = b - num_err
+
+        # Uniform random locations
+        rnd_cx = (w - 1) * torch.rand(num_rnd, generator=gen, device=self.device)
+        rnd_cy = (h - 1) * torch.rand(num_rnd, generator=gen, device=self.device)
+
+        if num_err > 0:
+            # Error-oriented locations using multinomial sampling on edge_weight
+            flat_weights = self.edge_weight.flatten()
+            if flat_weights.sum() > 0:
+                indices = torch.multinomial(flat_weights, num_err, replacement=True, generator=gen)
+                err_cx = (indices % w).float()
+                err_cy = torch.div(indices, w, rounding_mode='floor').float()
+            else:
+                err_cx = (w - 1) * torch.rand(num_err, generator=gen, device=self.device)
+                err_cy = (h - 1) * torch.rand(num_err, generator=gen, device=self.device)
+            out[:, 0] = torch.cat([err_cx, rnd_cx])
+            out[:, 1] = torch.cat([err_cy, rnd_cy])
+        else:
+            out[:, 0] = rnd_cx
+            out[:, 1] = rnd_cy
+
         # Standard uniform macro: a + (b - a) * rand()
         def uniform(idx, a, b_val):
             out[:, idx] = a + (b_val - a) * torch.rand(b, generator=gen, device=self.device)
 
         if shape_type in ("rotated_ellipse", "ellipse", "circle"):
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap if shape_type != "circle" else rx_cap)
             if shape_type == "rotated_ellipse":
@@ -79,8 +103,6 @@ class PyTorchDiffRenderer:
                 out[:, 4] = 0.0
 
         elif shape_type in ("rectangle", "rotated_rectangle"):
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap)
             if shape_type == "rotated_rectangle":
@@ -89,8 +111,6 @@ class PyTorchDiffRenderer:
                 out[:, 4] = 0.0
 
         elif shape_type == "triangle":
-            uniform(0, 0, w - 1)
-            uniform(1, 0, h - 1)
             uniform(2, 10, max(10, w * (max_size_frac or 0.25)))
             uniform(3, 0, 2 * math.pi)
             uniform(4, 0.5, 2.0)

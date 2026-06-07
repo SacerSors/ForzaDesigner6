@@ -437,8 +437,10 @@ class Engine:
         tonal coverage) without exploding scoring cost at higher
         max_resolutions (4K / 8K targets).
         """
+        if progress < 0.05:
+            return 1.00        # 0-5%: ~100% canvas - for very large background fills
         if progress < 0.25:
-            return 0.30        # 0–25%: ~30% canvas — modest bump over legacy for tonal blocks
+            return 0.30        # 6–25%: ~30% canvas — modest bump over legacy for tonal blocks
         if progress < 0.50:
             return 0.22        # 26–50%: ~22% canvas
         if progress < 0.75:
