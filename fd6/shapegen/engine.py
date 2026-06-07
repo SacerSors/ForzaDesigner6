@@ -356,6 +356,8 @@ class Engine:
                 if PyTorchDiffRenderer is None:
                     raise ImportError("PyTorchDiffRenderer could not be imported earlier.")
                 self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight)
+                # Give the GPU backend a reference to the LIVE shared memory edge map so it can sync updates
+                self._gpu._external_edge_weight = self.edge_weight
                 self._backend = "pytorch"
                 logger.warning("Engine init: PyTorchDiffRenderer instantiated successfully.")
             except Exception as exc:

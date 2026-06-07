@@ -347,7 +347,7 @@ class PyTorchDiffRenderer:
         full_sq = (((cur_tensor - self.target)**2) * self.edge_weight.unsqueeze(-1)).sum()
 
         n_random = max(1, n_random)
-        chunk_size = 512
+        chunk_size = 128
 
         # We will track the best shapes across all evaluated types
         overall_best_score = float('inf')
