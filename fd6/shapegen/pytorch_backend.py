@@ -54,17 +54,47 @@ class PyTorchDiffRenderer:
         # F.grid_sample expects coordinates in [-1, 1] for (x, y)
 
     def _generate_base_xy(self, b: int, w: int, h: int, rng: random.Random) -> torch.Tensor:
-        """Generates base (X, Y) coordinates to be shared across all shape types natively on GPU."""
+        """Generates base (X, Y) coordinates using Stratified Grid Sampling (Jittered Grid).
+
+        This perfectly covers the image without missing any pixels, distributing the
+        `b` samples evenly across the canvas while maintaining randomness to prevent artifacts.
+        """
         seed = rng.randint(0, 2**31 - 1)
         gen = torch.Generator(device=self.device)
         gen.manual_seed(seed)
 
         xy = torch.empty((b, 2), dtype=torch.float32, device=self.device)
 
-        # 100% pure uniform GPU generation. Multinomial probability maps were too slow and bottlenecked the GPU.
-        # It is faster to generate millions of uniform samples than thousands of weighted samples.
-        xy[:, 0] = (w - 1) * torch.rand(b, generator=gen, device=self.device)
-        xy[:, 1] = (h - 1) * torch.rand(b, generator=gen, device=self.device)
+        # Calculate optimal grid dimensions to fit `b` squares into the aspect ratio
+        aspect = w / h
+        cols = max(1, int(math.sqrt(b * aspect)))
+        rows = max(1, b // cols)
+
+        grid_b = cols * rows
+
+        if grid_b > 0:
+            # Generate perfect grid centers
+            x_step = w / cols
+            y_step = h / rows
+
+            y_idx, x_idx = torch.meshgrid(torch.arange(rows, device=self.device),
+                                          torch.arange(cols, device=self.device), indexing='ij')
+
+            # Add random jitter within each cell
+            x_jitter = x_step * torch.rand(rows, cols, generator=gen, device=self.device)
+            y_jitter = y_step * torch.rand(rows, cols, generator=gen, device=self.device)
+
+            x_coords = (x_idx.float() * x_step + x_jitter).view(-1)
+            y_coords = (y_idx.float() * y_step + y_jitter).view(-1)
+
+            xy[:grid_b, 0] = torch.clamp(x_coords, 0, w - 1)
+            xy[:grid_b, 1] = torch.clamp(y_coords, 0, h - 1)
+
+        # If `b` doesn't divide perfectly into rows*cols, fill the remainder completely randomly
+        rem = b - grid_b
+        if rem > 0:
+            xy[grid_b:, 0] = (w - 1) * torch.rand(rem, generator=gen, device=self.device)
+            xy[grid_b:, 1] = (h - 1) * torch.rand(rem, generator=gen, device=self.device)
 
         return xy
 
@@ -344,9 +374,12 @@ class PyTorchDiffRenderer:
         Returns: grid (B, T, T, 2), cur_t, tgt_t, alpha_t, edge_t
         """
         B = params.shape[0]
-        # Calculate optimal tile size
+        # Calculate optimal tile size. Padding mathematically accounts for:
+        # 1. 1.5x scaling for corner rotation
+        # 2. 40px translation buffer for optimizer movements
+        # 3. 4px sigmoid slope transition width
         max_r = torch.max(torch.maximum(params[:, 2], params[:, 3])).item() if B else 1.0
-        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(max_r) + 2)))
+        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(max_r * 1.5) + 40)))
 
         xy = params[:, 0:2]
         return self._extract_tiles_core(xy, T, cur_tensor)
@@ -395,8 +428,12 @@ class PyTorchDiffRenderer:
             t_max = torch.max(torch.maximum(p[:, 2], p[:, 3])).item() if n_random else 1.0
             global_max_r = max(global_max_r, t_max)
 
-        # Calculate optimal tile size T globally for all competing shapes
-        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(global_max_r) + 2)))
+        # Calculate optimal tile size T globally for all competing shapes.
+        # Padding mathematically accounts for:
+        # 1. 1.5x scaling for corner rotation (sqrt(2))
+        # 2. 40px translation buffer for optimizer movements
+        # 3. 4px sigmoid slope transition width
+        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(global_max_r * 1.5) + 40)))
 
         # Dynamic Chunk Sizing based on global T
         bytes_per_tile = T * T * 3 * 4
@@ -441,7 +478,8 @@ class PyTorchDiffRenderer:
             all_colors = torch.cat(type_colors[shape_type])
             params = type_params[shape_type]
 
-            K = min(16, n_random)
+            # Elevate top K from 16 to 256 for significantly higher shape fitness guarantees
+            K = min(256, n_random)
             sorted_scores, sorted_indices = torch.sort(all_scores)
             top_indices = sorted_indices[:K]
 
