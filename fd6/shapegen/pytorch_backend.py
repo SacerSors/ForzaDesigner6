@@ -54,29 +54,17 @@ class PyTorchDiffRenderer:
         # F.grid_sample expects coordinates in [-1, 1] for (x, y)
 
     def _generate_base_xy(self, b: int, w: int, h: int, rng: random.Random) -> torch.Tensor:
-        """Generates base (X, Y) coordinates to be shared across all shape types."""
+        """Generates base (X, Y) coordinates to be shared across all shape types natively on GPU."""
         seed = rng.randint(0, 2**31 - 1)
         gen = torch.Generator(device=self.device)
         gen.manual_seed(seed)
 
         xy = torch.empty((b, 2), dtype=torch.float32, device=self.device)
 
-        # 25% error-weighted placement
-        b_err = int(b * 0.25)
-
-        if b_err > 0:
-            flat_edge_weight = self.edge_weight.view(-1)
-            if flat_edge_weight.sum() > 1e-5:
-                sampled_indices = torch.multinomial(flat_edge_weight, b_err, replacement=True, generator=gen)
-                xy[:b_err, 0] = (sampled_indices % w).float()
-                xy[:b_err, 1] = (sampled_indices // w).float()
-            else:
-                xy[:b_err, 0] = (w - 1) * torch.rand(b_err, generator=gen, device=self.device)
-                xy[:b_err, 1] = (h - 1) * torch.rand(b_err, generator=gen, device=self.device)
-
-        if b > b_err:
-            xy[b_err:, 0] = (w - 1) * torch.rand(b - b_err, generator=gen, device=self.device)
-            xy[b_err:, 1] = (h - 1) * torch.rand(b - b_err, generator=gen, device=self.device)
+        # 100% pure uniform GPU generation. Multinomial probability maps were too slow and bottlenecked the GPU.
+        # It is faster to generate millions of uniform samples than thousands of weighted samples.
+        xy[:, 0] = (w - 1) * torch.rand(b, generator=gen, device=self.device)
+        xy[:, 1] = (h - 1) * torch.rand(b, generator=gen, device=self.device)
 
         return xy
 
@@ -478,9 +466,17 @@ class PyTorchDiffRenderer:
             beta2 = 0.999
             eps = 1e-8
 
+            # Parameter-specific learning rate bounds
+            # X, Y, rx, ry scale from 10 pixels to 1 pixel.
+            # Angle scales from 0.174 rad (10 deg) to 0.017 rad (1 deg).
+            # Alpha scales from 0.10 (10%) to 0.01 (1%).
+            lr_max = torch.tensor([10.0, 10.0, 10.0, 10.0, 0.1745, 0.10], device=self.device)
+            lr_min = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.01745, 0.01], device=self.device)
+
             for t in range(1, n_mutate + 1):
-                # Learning Rate Decay (Idea C): Linearly scale from 1.0 down to 0.1
-                lr = 1.0 - (0.9 * ((t - 1) / max(1, n_mutate - 1)))
+                # Learning Rate Decay (Idea C): Linearly scale across the 6 parameters
+                progress = (t - 1) / max(1, n_mutate - 1)
+                lr = lr_max - ((lr_max - lr_min) * progress)
 
                 if top_params.grad is not None:
                     top_params.grad.zero_()
