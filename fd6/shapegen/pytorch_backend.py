@@ -9,9 +9,13 @@ import numpy as np
 try:
     import torch
     import torch.nn.functional as F
+    def _compile_if_available(fn):
+        return torch.compile(fn, mode="reduce-overhead", dynamic=True)
 except ImportError:
     torch = None
     F = None
+    def _compile_if_available(fn):
+        return fn
 
 from fd6.shapegen.shapes import Shape
 from fd6.shapegen.shapes.ellipse import RotatedEllipse
@@ -155,6 +159,7 @@ class PyTorchDiffRenderer:
 
         return out
 
+    @_compile_if_available
     def _sdf_ellipse(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Approximate SDF for an ellipse.
@@ -188,6 +193,7 @@ class PyTorchDiffRenderer:
         mask = torch.sigmoid(-d * 100.0)
         return mask
 
+    @_compile_if_available
     def _sdf_rectangle(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Exact SDF for a rectangle.
@@ -220,6 +226,7 @@ class PyTorchDiffRenderer:
         mask = torch.sigmoid(-d * 50.0)
         return mask
 
+    @_compile_if_available
     def _sdf_triangle(self, p: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Approximate SDF for an isosceles triangle pointing up.
@@ -276,6 +283,7 @@ class PyTorchDiffRenderer:
         else:
             raise ValueError(f"Unsupported shape type: {shape_type}")
 
+    @_compile_if_available
     def _score_and_color(self, cur_t: torch.Tensor, tgt_t: torch.Tensor, alpha_t: torch.Tensor, edge_t: torch.Tensor, mask: torch.Tensor, full_sq: torch.Tensor, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Computes score and optimal color for a batch of masks over the LOCAL tiles.
