@@ -33,9 +33,10 @@ class PyTorchDiffRenderer:
     using the Adam optimizer with an edge-weighted MSE loss over SDFs.
     """
 
-    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray) -> None:
+    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray, vram_scalar: int = 256) -> None:
         if torch is None:
             raise RuntimeError("PyTorch is not available.")
+        self.vram_scalar = vram_scalar
         logger.warning("cuda: " + str(torch.cuda.is_available()))
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self._compiled_warmup_done = False
@@ -213,18 +214,30 @@ class PyTorchDiffRenderer:
         diff = tgt_t - (1.0 - a_view) * cur_t
         eff_u = eff.unsqueeze(-1)
         numer = (eff_u * diff).sum(dim=(1, 2))
+
+        # Optimize safely without unnecessary unsqueeze calls that create new views
         safe = eff_sum > 0.5
         denom_safe = torch.where(safe, denom, torch.ones_like(denom))
-        color = torch.where(safe.unsqueeze(-1), torch.clamp(numer / denom_safe.unsqueeze(-1), 0.0, 1.0), 0.0)
+        safe_u = safe.unsqueeze(-1)
+        denom_safe_u = denom_safe.unsqueeze(-1)
+
+        color = torch.where(safe_u, torch.clamp(numer / denom_safe_u, 0.0, 1.0), 0.0)
 
         m = mask.unsqueeze(-1)
         color_view = color.view(B, 1, 1, 3)
-        blended = m * (a_view * color_view + (1.0 - a_view) * cur_t) + (1.0 - m) * cur_t
+
+        # Optimize the error difference math to avoid allocating (cur_t - tgt_t)**2
+        # blended = cur_t + delta
+        delta = m * a_view * (color_view - cur_t)
         w_t = edge_t.unsqueeze(-1)
 
-        region_old = (w_t * (cur_t - tgt_t) ** 2).sum(dim=(1, 2, 3))
-        region_new = (w_t * (blended - tgt_t) ** 2).sum(dim=(1, 2, 3))
-        total = full_sq - region_old + region_new
+        # change = region_new - region_old
+        # = sum(w_t * ( (cur_t - tgt_t + delta)**2 - (cur_t - tgt_t)**2 ))
+        # = sum(w_t * ( 2*(cur_t - tgt_t)*delta + delta**2 ))
+        diff_ct = cur_t - tgt_t
+        change = (w_t * (2.0 * diff_ct * delta + delta ** 2)).sum(dim=(1, 2, 3))
+
+        total = full_sq + change
 
         n = n_weight if n_weight >= 1.0 else 1.0
         score = torch.sqrt(torch.clamp(total, min=0.0) / n)
@@ -304,6 +317,16 @@ class PyTorchDiffRenderer:
             torch.cuda.empty_cache()
 
     def search(self, canvas: np.ndarray, n_random: int, n_mutate: int, max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
+        # Scale down sample count for large shapes to drastically improve performance
+        # without losing detail quality (which is needed mostly for tiny shapes).
+        if max_size_frac is not None:
+            if max_size_frac >= 0.5:
+                n_random = int(n_random * 0.1)
+            elif max_size_frac >= 0.3:
+                n_random = int(n_random * 0.25)
+            elif max_size_frac >= 0.15:
+                n_random = int(n_random * 0.5)
+
         # Collect available shape types
         types = ["rotated_ellipse"] # default fallback
         if hasattr(self, '_current_types') and self._current_types:
@@ -333,26 +356,28 @@ class PyTorchDiffRenderer:
             t_max = torch.max(torch.maximum(p[:, 2], p[:, 3])).item() if n_random else 1.0
             global_max_r = max(global_max_r, t_max)
 
-        # Calculate optimal tile size T globally for all competing shapes.
-        # Padding mathematically accounts for:
-        # 1. 1.5x scaling for corner rotation (sqrt(2))
-        # 2. 40px translation buffer for optimizer movements
-        # 3. 4px sigmoid slope transition width
-        T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(global_max_r * 1.5) + 40)))
+        # Sort shapes dynamically by their radius across all types so small shapes
+        # don't incur the massive VRAM and computational penalty of a canvas-sized tile.
 
-        # Dynamic Chunk Sizing based on global T
-        # Accounting for actual VRAM usage during scoring (grid, cur_t, tgt_t, alpha_t, edge_t, mask, diff, eff, etc)
-        # ~20 floats per pixel. 20 * 4 bytes = 80 bytes per pixel.
-        bytes_per_tile = T * T * 20 * 4
-        chunk_size = max(2, int((256 * 1024 * 1024) / max(1, bytes_per_tile)))
-        chunk_size = min(chunk_size, n_random)
+        # Calculate the max radius for each coordinate across ALL shape types
+        max_r_per_coord = torch.zeros(n_random, device=self.device)
+        for shape_type in types:
+            p = type_params[shape_type]
+            max_r_per_coord = torch.maximum(max_r_per_coord, torch.maximum(p[:, 2], p[:, 3]))
+
+        # Sort by the combined max radius
+        sorted_radii, sorted_indices = torch.sort(max_r_per_coord)
+
+        base_xy_sorted = base_xy[sorted_indices]
+        for shape_type in types:
+            type_params[shape_type] = type_params[shape_type][sorted_indices]
 
         # Synchronous warmup pass to force Triton to compile cleanly without filelock threading crashes
         if not self._compiled_warmup_done and torch.cuda.is_available():
             with torch.no_grad():
                 dummy_xy = torch.zeros((1, 2), device=self.device)
                 dummy_p = torch.zeros((1, 6), device=self.device)
-                dummy_grid, dummy_cur, dummy_tgt, dummy_alpha, dummy_edge = self._extract_tiles_core(dummy_xy, max(2, T), cur_tensor)
+                dummy_grid, dummy_cur, dummy_tgt, dummy_alpha, dummy_edge = self._extract_tiles_core(dummy_xy, 16, cur_tensor)
 
                 for t in types:
                     dummy_m = self._get_mask(t, dummy_grid, dummy_p)
@@ -364,19 +389,50 @@ class PyTorchDiffRenderer:
         type_colors = {t: [] for t in types}
 
         # SHARED TILE EVALUATION
-        # We loop over the chunk indices once, extract the VRAM tile exactly ONCE,
-        # and evaluate all active shape types sequentially over the same hot L1 cache memory!
+        # We process dynamically sized chunks. Small shapes get massive chunks,
+        # huge shapes get tiny chunks, optimizing VRAM use and cache performance perfectly.
         with torch.no_grad():
-            for i in range(0, n_random, chunk_size):
-                xy_chunk = base_xy[i:i+chunk_size]
+            i = 0
+            vram_budget = self.vram_scalar * 1024 * 1024
+            while i < n_random:
+                # Find the mathematically optimal chunk size via binary search so we never exceed VRAM budget
+                left = 1
+                right = n_random - i
+
+                # Minimum guarantee: We MUST process at least 1 shape, even if it exceeds the VRAM budget,
+                # otherwise the binary search fails and crops massive shapes to tiny 2x2 bounding boxes.
+                best_chunk = 1
+                first_shape_r = sorted_radii[i].item()
+                best_T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(first_shape_r * 1.5) + 40)))
+
+                while left <= right:
+                    mid = (left + right) // 2
+                    chunk_max_r = sorted_radii[i + mid - 1].item()
+                    test_T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(chunk_max_r * 1.5) + 40)))
+                    bytes_per_tile = test_T * test_T * 20 * 4
+
+                    if mid * bytes_per_tile <= vram_budget:
+                        best_chunk = mid
+                        best_T = test_T
+                        left = mid + 1
+                    else:
+                        right = mid - 1
+
+                chunk_size = best_chunk
+                T = best_T
+
+                actual_chunk_end = i + chunk_size
+                xy_chunk = base_xy_sorted[i:actual_chunk_end]
                 grid, cur_t, tgt_t, alpha_t, edge_t = self._extract_tiles_core(xy_chunk, T, cur_tensor)
 
                 for shape_type in types:
-                    p_chunk = type_params[shape_type][i:i+chunk_size]
+                    p_chunk = type_params[shape_type][i:actual_chunk_end]
                     mask = self._get_mask(shape_type, grid, p_chunk)
                     sc, col = PyTorchDiffRenderer._score_and_color(cur_t, tgt_t, alpha_t, edge_t, mask, full_sq, p_chunk, self.n_weight)
                     type_scores[shape_type].append(sc)
                     type_colors[shape_type].append(col)
+
+                i += chunk_size
 
         overall_best_score = float('inf')
         overall_best_params = None
@@ -443,6 +499,16 @@ class PyTorchDiffRenderer:
                 sc, col = PyTorchDiffRenderer._score_and_color(
                     cur_t_top, tgt_t_top, alpha_t_top, edge_t_top,
                     mask, full_sq, top_params, self.n_weight)
+
+                # Check for improvements based on the CURRENT forward pass before we update params
+                with torch.no_grad():
+                    min_sc, min_idx = torch.min(sc, dim=0)
+                    if min_sc.item() < best_opt_score:
+                        best_opt_score = min_sc.item()
+                        best_idx = min_idx.item()
+                        best_opt_params = top_params[best_idx].detach().clone()
+                        best_opt_color = col[best_idx].detach().clone()
+
                 loss = sc.mean()
                 if not math.isfinite(loss.item()):
                     break
@@ -467,16 +533,16 @@ class PyTorchDiffRenderer:
                         top_params[:, 2] = torch.clamp(top_params[:, 2], 1.0, rx_cap)
                         top_params[:, 3] = torch.clamp(top_params[:, 3], 1.0, ry_cap)
 
-                #logger.warning("before no Grade 2")
-                with torch.no_grad():
-                    mask_eval = self._get_mask(shape_type, grid_top, top_params)
-                    sc_eval, col_eval = PyTorchDiffRenderer._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq, top_params, self.n_weight)
-                    min_sc, min_idx = torch.min(sc_eval, dim=0)
-                    if min_sc.item() < best_opt_score:
-                        best_opt_score = min_sc.item()
-                        best_idx = min_idx.item()
-                        best_opt_params = top_params[best_idx].detach().clone()
-                        best_opt_color = col_eval[best_idx].detach().clone()
+            # Do one final evaluation pass at the very end to check the parameters generated by the last update
+            with torch.no_grad():
+                mask_eval = self._get_mask(shape_type, grid_top, top_params)
+                sc_eval, col_eval = PyTorchDiffRenderer._score_and_color(cur_t_top, tgt_t_top, alpha_t_top, edge_t_top, mask_eval, full_sq, top_params, self.n_weight)
+                min_sc, min_idx = torch.min(sc_eval, dim=0)
+                if min_sc.item() < best_opt_score:
+                    best_opt_score = min_sc.item()
+                    best_idx = min_idx.item()
+                    best_opt_params = top_params[best_idx].detach().clone()
+                    best_opt_color = col_eval[best_idx].detach().clone()
 
             #logger.warning("before score")
             # Compare with overall best
