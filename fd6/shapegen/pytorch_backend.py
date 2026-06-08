@@ -36,6 +36,7 @@ class PyTorchDiffRenderer:
             raise RuntimeError("PyTorch is not available.")
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._compiled_warmup_done = False
 
         self.h, self.w = target.shape[:2]
         # Use np.array(copy=True) to avoid PyTorch warnings and potential segfaults
@@ -447,6 +448,17 @@ class PyTorchDiffRenderer:
         bytes_per_tile = T * T * 3 * 4
         chunk_size = max(2, int((256 * 1024 * 1024) / max(1, bytes_per_tile)))
         chunk_size = min(chunk_size, n_random)
+
+        # Synchronous warmup pass to force Triton to compile cleanly without filelock threading crashes
+        if not self._compiled_warmup_done and torch.cuda.is_available():
+            with torch.no_grad():
+                dummy_xy = torch.zeros((1, 2), device=self.device)
+                dummy_p = torch.zeros((1, 6), device=self.device)
+                dummy_grid, dummy_cur, dummy_tgt, dummy_alpha, dummy_edge = self._extract_tiles_core(dummy_xy, max(2, T), cur_tensor)
+                for t in types:
+                    dummy_m = self._get_mask(t, dummy_grid, dummy_p)
+                    self._score_and_color(dummy_cur, dummy_tgt, dummy_alpha, dummy_edge, dummy_m, full_sq, dummy_p)
+            self._compiled_warmup_done = True
 
         # We will track all scores for all types
         type_scores = {t: [] for t in types}
