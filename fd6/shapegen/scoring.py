@@ -19,15 +19,14 @@ def compute_edge_weight(
     target: np.ndarray,
     alpha_mask: np.ndarray | None = None,
     boost: float = EDGE_BOOST,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build an H×W float32 importance map and edge direction map for `target`.
+) -> np.ndarray:
+    """Build an H×W float32 importance map for `target`.
 
     Computes a full RGB Sobel-gradient magnitude (normalized 0..1) to catch
     both luminance and color boundaries.
 
     Returns:
         edge_weight: HxW float32 array, 1.0 in flat areas, up to `boost` on edges.
-        edge_dir: HxW float32 array, the gradient angle (direction) at each pixel in radians.
     """
     h, w = target.shape[:2]
 
@@ -59,17 +58,6 @@ def compute_edge_weight(
     mag_sq = np.maximum(np.maximum(mag_r, mag_g), mag_b)
     mag = np.sqrt(mag_sq)
 
-    # To calculate the edge direction, we use the gradients of the channel
-    # that had the strongest magnitude response at each pixel.
-    idx_max = np.argmax(np.stack([mag_r, mag_g, mag_b], axis=0), axis=0)
-
-    gx_strong = np.choose(idx_max, [gx_r, gx_g, gx_b])
-    gy_strong = np.choose(idx_max, [gy_r, gy_g, gy_b])
-
-    # Calculate edge direction (perpendicular to gradient)
-    # arctan2 gives [-pi, pi]. Edge direction is gradient + 90 degrees (pi/2)
-    edge_dir = np.arctan2(gy_strong, gx_strong) + (np.pi / 2.0)
-
     max_mag = float(mag.max())
     if max_mag < 1e-6:
         # Flat image — every pixel is baseline weight.
@@ -80,7 +68,7 @@ def compute_edge_weight(
     if alpha_mask is not None:
         norm = norm * (alpha_mask > 0).astype(np.float32)
 
-    return norm, edge_dir.astype(np.float32)
+    return norm
 
 
 def rms_error(

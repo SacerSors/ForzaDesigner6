@@ -294,9 +294,8 @@ class Engine:
         # `edge_weight` shared-memory buffer starts at the base and is
         # periodically reblended with the residual error map below so unfinished
         # regions get boosted late in generation.
-        norm_weight, edge_dir = compute_edge_weight(self.target, self.alpha_mask)
+        norm_weight = compute_edge_weight(self.target, self.alpha_mask)
         self._base_edge_weight: np.ndarray = norm_weight.astype(np.float32)
-        self._edge_dir: np.ndarray = edge_dir.astype(np.float32)
 
         self._edge_weight_shm: shared_memory.SharedMemory | None = shared_memory.SharedMemory(
             create=True, size=self._base_edge_weight.nbytes,
@@ -358,7 +357,7 @@ class Engine:
             try:
                 if PyTorchDiffRenderer is None:
                     raise ImportError("PyTorchDiffRenderer could not be imported earlier.")
-                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight, self._edge_dir)
+                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight)
                 # Give the GPU backend a reference to the LIVE shared memory edge map so it can sync updates
                 self._gpu._external_edge_weight = self.edge_weight
                 self._backend = "pytorch"
@@ -645,6 +644,7 @@ class Engine:
                 self._backend = "cpu"
                 self._gpu = None
                 self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
+                logger.warning("fallback to CPU because: " + str(self._gpu_fallback_reason)+" trace:\n")
         elif self._backend == "gpu" and self._gpu is not None:
             try:
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)

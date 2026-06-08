@@ -22,7 +22,7 @@ def _setup(size=80):
     alpha = np.full((size, size), 255, np.uint8)
     alpha[:6, :] = 0  # an edge-buffer-like ring so the sticker path is exercised
     alpha[-6:, :] = 0
-    edge_weight, _ = compute_edge_weight(target, alpha)
+    edge_weight = compute_edge_weight(target, alpha)
     edge = edge_weight.astype(np.float32)
     return target, canvas, alpha, edge
 
