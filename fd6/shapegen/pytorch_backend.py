@@ -10,7 +10,9 @@ try:
     import torch
     import torch.nn.functional as F
     def _compile_if_available(fn):
-        return torch.compile(fn, mode="reduce-overhead", dynamic=True)
+        # max-autotune fuses kernels but avoids the strict CUDA Graph memory limitations
+        # of reduce-overhead, which conflict with dynamic shape tile sizes.
+        return torch.compile(fn, mode="max-autotune", dynamic=True)
 except ImportError:
     torch = None
     F = None
