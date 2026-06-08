@@ -33,9 +33,10 @@ class PyTorchDiffRenderer:
     using the Adam optimizer with an edge-weighted MSE loss over SDFs.
     """
 
-    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray) -> None:
+    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray, vram_scalar: int = 256) -> None:
         if torch is None:
             raise RuntimeError("PyTorch is not available.")
+        self.vram_scalar = vram_scalar
         logger.warning("cuda: " + str(torch.cuda.is_available()))
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self._compiled_warmup_done = False
@@ -213,9 +214,14 @@ class PyTorchDiffRenderer:
         diff = tgt_t - (1.0 - a_view) * cur_t
         eff_u = eff.unsqueeze(-1)
         numer = (eff_u * diff).sum(dim=(1, 2))
+
+        # Optimize safely without unnecessary unsqueeze calls that create new views
         safe = eff_sum > 0.5
         denom_safe = torch.where(safe, denom, torch.ones_like(denom))
-        color = torch.where(safe.unsqueeze(-1), torch.clamp(numer / denom_safe.unsqueeze(-1), 0.0, 1.0), 0.0)
+        safe_u = safe.unsqueeze(-1)
+        denom_safe_u = denom_safe.unsqueeze(-1)
+
+        color = torch.where(safe_u, torch.clamp(numer / denom_safe_u, 0.0, 1.0), 0.0)
 
         m = mask.unsqueeze(-1)
         color_view = color.view(B, 1, 1, 3)
@@ -344,7 +350,7 @@ class PyTorchDiffRenderer:
         # Accounting for actual VRAM usage during scoring (grid, cur_t, tgt_t, alpha_t, edge_t, mask, diff, eff, etc)
         # ~20 floats per pixel. 20 * 4 bytes = 80 bytes per pixel.
         bytes_per_tile = T * T * 20 * 4
-        chunk_size = max(2, int((256 * 1024 * 1024) / max(1, bytes_per_tile)))
+        chunk_size = max(2, int((self.vram_scalar * 1024 * 1024) / max(1, bytes_per_tile)))
         chunk_size = min(chunk_size, n_random)
 
         # Synchronous warmup pass to force Triton to compile cleanly without filelock threading crashes

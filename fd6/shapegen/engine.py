@@ -357,7 +357,9 @@ class Engine:
             try:
                 if PyTorchDiffRenderer is None:
                     raise ImportError("PyTorchDiffRenderer could not be imported earlier.")
-                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight)
+                self._gpu = PyTorchDiffRenderer(
+                    self.target, self.alpha_mask, self.edge_weight, vram_scalar=self.profile.vram_scalar
+                )
                 # Give the GPU backend a reference to the LIVE shared memory edge map so it can sync updates
                 self._gpu._external_edge_weight = self.edge_weight
                 self._backend = "pytorch"

@@ -141,6 +141,12 @@ class SettingsPanel(QWidget):
             "10 = redraw every 10 shapes (faster, choppier). Doesn't affect "
             "the final result, only what you see while it's running."
         )
+        self.vram_scalar = QSpinBox(); self.vram_scalar.setRange(32, 8192); self.vram_scalar.setValue(256)
+        self.vram_scalar.setToolTip(
+            "Controls the maximum chunk size used for calculating shape placements in the "
+            "PyTorch compute backend. Higher values use more VRAM but might be faster "
+            "depending on your GPU. A value of 256 uses roughly 8GB of VRAM total at 2000x2000px."
+        )
         # QFormLayout auto-creates QLabel widgets for the left column. Those
         # labels do NOT inherit tooltips from their paired field, so hovering
         # the text "Stop at shapes" would show nothing. Create the labels
@@ -153,6 +159,7 @@ class SettingsPanel(QWidget):
             ("Max resolution (px)", self.max_resolution),
             ("Threads (0=auto)", self.max_threads),
             ("Preview every N", self.preview_every),
+            ("VRAM Scalar", self.vram_scalar),
         ):
             row_label = QLabel(label_text, adv)
             row_label.setToolTip(field.toolTip())
@@ -320,7 +327,7 @@ class SettingsPanel(QWidget):
         except Exception:
             return
         # Mirror into advanced widgets without re-emitting per-spinbox.
-        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
+        for w in (self.stop_at, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every, self.vram_scalar):
             w.blockSignals(True)
         self.stop_at.setValue(prof.stop_at)
         self.prune_to.setValue(getattr(prof, "prune_to", 0))
@@ -329,7 +336,8 @@ class SettingsPanel(QWidget):
         self.max_resolution.setValue(prof.max_resolution)
         self.max_threads.setValue(prof.max_threads)
         self.preview_every.setValue(prof.preview_every)
-        for w in (self.stop_at, self.prune_to, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every):
+        self.vram_scalar.setValue(getattr(prof, "vram_scalar", 256))
+        for w in (self.stop_at, self.prune_to, self.random_samples, self.mutated_samples, self.max_resolution, self.max_threads, self.preview_every, self.vram_scalar):
             w.blockSignals(False)
         for code, cb in self._shape_checks.items():
             cb.blockSignals(True)
@@ -370,6 +378,7 @@ class SettingsPanel(QWidget):
         base.max_resolution = self.max_resolution.value()
         base.max_threads = self.max_threads.value()
         base.preview_every = self.preview_every.value()
+        base.vram_scalar = self.vram_scalar.value()
         base.shape_types = [code for code, cb in self._shape_checks.items() if cb.isChecked()] or ["rotated_ellipse"]
         base.compute_backend = str(self.compute_backend.currentData() or "auto")
         return base

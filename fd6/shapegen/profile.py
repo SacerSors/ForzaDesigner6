@@ -21,6 +21,7 @@ class Profile:
     save_every: int = 100
     stop_at: int = 3000
     prune_to: int = 0
+    vram_scalar: int = 256
     shape_types: list[str] = field(default_factory=lambda: ["rotated_ellipse", "rotated_rectangle"])
     # Compute backend for the shape search: "auto" (GPU if a CUDA device + CuPy
     # are present, else CPU), "cpu" (force the multiprocess CPU path), or "gpu"
@@ -43,6 +44,7 @@ class Profile:
             "saveEvery": str(self.save_every),
             "stopAt": str(self.stop_at),
             "pruneTo": str(self.prune_to),
+            "vramScalar": str(self.vram_scalar),
             "shapeTypes": ",".join(self.shape_types),
             "computeBackend": self.compute_backend,
         }
@@ -94,6 +96,7 @@ def load_profile(name: str, text: str) -> Profile:
     p.save_every = getint("saveEvery", p.save_every)
     p.stop_at = getint("stopAt", p.stop_at)
     p.prune_to = getint("pruneTo", p.prune_to)
+    p.vram_scalar = getint("vramScalar", p.vram_scalar)
     if "shapeTypes" in section:
         p.shape_types = _parse_str_list(section["shapeTypes"])
     backend = getstr("computeBackend", p.compute_backend).lower().strip()
