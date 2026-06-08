@@ -6,11 +6,13 @@ from typing import Optional
 
 import numpy as np
 
+from fd6.shapegen.engine import logger
+
 try:
     import torch
     import torch.nn.functional as F
     def _compile_if_available(fn):
-        return torch.compile(fn, mode="reduce-overhead", dynamic=True)
+        return torch.compile(fn, dynamic=True)
 except ImportError:
     torch = None
     F = None
@@ -34,7 +36,7 @@ class PyTorchDiffRenderer:
     def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray) -> None:
         if torch is None:
             raise RuntimeError("PyTorch is not available.")
-
+        logger.warning("cuda: " + str(torch.cuda.is_available()))
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self._compiled_warmup_done = False
 
@@ -308,8 +310,7 @@ class PyTorchDiffRenderer:
         safe = eff_sum > 0.5
         denom_safe = torch.where(safe, denom, torch.ones_like(denom))
 
-        color = torch.where(safe.unsqueeze(-1), torch.clamp(numer / denom_safe.unsqueeze(-1), 0.0, 1.0), torch.zeros_like(numer))
-
+        color = torch.where(safe.unsqueeze(-1), torch.clamp(numer / denom_safe.unsqueeze(-1), 0.0, 1.0), 0.0)
         # Blended image
         m = mask.unsqueeze(-1) # (B, T, T, 1)
         color_view = color.view(B, 1, 1, 3)
@@ -332,8 +333,7 @@ class PyTorchDiffRenderer:
         ratio = torch.where(body_total >= 1.0, opaque / torch.clamp(body_total, min=1.0), torch.zeros_like(body_total))
         reject = (body_total < 1.0) | (ratio < 0.995)
 
-        score = torch.where(reject, torch.tensor(float('inf'), device=score.device), score)
-
+        score = torch.where(reject, torch.inf, score)
         return score, color
 
     def _extract_tiles_core(self, xy: torch.Tensor, T: int, cur_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -493,7 +493,7 @@ class PyTorchDiffRenderer:
             params = type_params[shape_type]
 
             # Elevate top K from 16 to 256 for significantly higher shape fitness guarantees
-            K = min(256, n_random)
+            K = 64
             sorted_scores, sorted_indices = torch.sort(all_scores)
             top_indices = sorted_indices[:K]
 
@@ -509,6 +509,7 @@ class PyTorchDiffRenderer:
             best_opt_color = all_colors[top_indices[0]].detach().clone()
 
             n_mutate = max(1, n_mutate)
+            logger.warning("mutate: " + n_mutate)
 
             grid_top, cur_t_top, tgt_t_top, alpha_t_top, edge_t_top = self._extract_tiles(top_params, cur_tensor)
 
