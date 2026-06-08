@@ -19,50 +19,68 @@ def compute_edge_weight(
     target: np.ndarray,
     alpha_mask: np.ndarray | None = None,
     boost: float = EDGE_BOOST,
-) -> np.ndarray:
-    """Build an H×W float32 importance map for `target`.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build an H×W float32 importance map and edge direction map for `target`.
 
-    Combines a Sobel-gradient magnitude (normalized 0..1) with the alpha mask
-    so the result is:
-        - 0       where alpha_mask says transparent / buffer (ignored entirely)
-        - 1       in smooth interior regions
-        - up to `boost` on the strongest edges
+    Computes a full RGB Sobel-gradient magnitude (normalized 0..1) to catch
+    both luminance and color boundaries.
 
-    Pass this to `rms_error` / `precompute_canvas_error` / `score_shape` /
-    `composite` as the `edge_weight` keyword. Build it ONCE per generation
-    (the target doesn't change) and reuse for every score.
+    Returns:
+        edge_weight: HxW float32 array, 1.0 in flat areas, up to `boost` on edges.
+        edge_dir: HxW float32 array, the gradient angle (direction) at each pixel in radians.
     """
     h, w = target.shape[:2]
-    # Luminance — cheap proxy for "what the eye sees" so eye/mouth/outline
-    # edges register on grayscale gradients even when the RGB diff is mild.
-    lum = (
-        target[:, :, 0].astype(np.float32) * 0.299
-        + target[:, :, 1].astype(np.float32) * 0.587
-        + target[:, :, 2].astype(np.float32) * 0.114
-    )
-    # 3×3 Sobel kernels expressed as a manual convolution (avoids a SciPy
-    # dependency, fast enough since we only run it once per generation).
-    pad = np.pad(lum, 1, mode="edge")
-    gx = (
-        -1.0 * pad[0:h, 0:w]   + 0.0 * pad[0:h, 1:w+1]   + 1.0 * pad[0:h, 2:w+2]
-        + -2.0 * pad[1:h+1, 0:w] + 0.0 * pad[1:h+1, 1:w+1] + 2.0 * pad[1:h+1, 2:w+2]
-        + -1.0 * pad[2:h+2, 0:w] + 0.0 * pad[2:h+2, 1:w+1] + 1.0 * pad[2:h+2, 2:w+2]
-    )
-    gy = (
-        -1.0 * pad[0:h, 0:w]   + -2.0 * pad[0:h, 1:w+1]   + -1.0 * pad[0:h, 2:w+2]
-        + 0.0 * pad[1:h+1, 0:w] + 0.0 * pad[1:h+1, 1:w+1] + 0.0 * pad[1:h+1, 2:w+2]
-        + 1.0 * pad[2:h+2, 0:w] + 2.0 * pad[2:h+2, 1:w+1] + 1.0 * pad[2:h+2, 2:w+2]
-    )
-    mag = np.sqrt(gx * gx + gy * gy)
+
+    # 3×3 Sobel kernels expressed as a manual convolution (avoids a SciPy dependency)
+    def sobel(channel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        pad = np.pad(channel, 1, mode="edge")
+        gx = (
+            -1.0 * pad[0:h, 0:w]   + 0.0 * pad[0:h, 1:w+1]   + 1.0 * pad[0:h, 2:w+2]
+            + -2.0 * pad[1:h+1, 0:w] + 0.0 * pad[1:h+1, 1:w+1] + 2.0 * pad[1:h+1, 2:w+2]
+            + -1.0 * pad[2:h+2, 0:w] + 0.0 * pad[2:h+2, 1:w+1] + 1.0 * pad[2:h+2, 2:w+2]
+        )
+        gy = (
+            -1.0 * pad[0:h, 0:w]   + -2.0 * pad[0:h, 1:w+1]   + -1.0 * pad[0:h, 2:w+2]
+            + 0.0 * pad[1:h+1, 0:w] + 0.0 * pad[1:h+1, 1:w+1] + 0.0 * pad[1:h+1, 2:w+2]
+            + 1.0 * pad[2:h+2, 0:w] + 2.0 * pad[2:h+2, 1:w+1] + 1.0 * pad[2:h+2, 2:w+2]
+        )
+        return gx, gy
+
+    # Calculate gradients for each RGB channel to catch color edges
+    gx_r, gy_r = sobel(target[:, :, 0].astype(np.float32))
+    gx_g, gy_g = sobel(target[:, :, 1].astype(np.float32))
+    gx_b, gy_b = sobel(target[:, :, 2].astype(np.float32))
+
+    # Combine magnitudes by taking the max response across RGB channels
+    mag_r = gx_r**2 + gy_r**2
+    mag_g = gx_g**2 + gy_g**2
+    mag_b = gx_b**2 + gy_b**2
+
+    mag_sq = np.maximum(np.maximum(mag_r, mag_g), mag_b)
+    mag = np.sqrt(mag_sq)
+
+    # To calculate the edge direction, we use the gradients of the channel
+    # that had the strongest magnitude response at each pixel.
+    idx_max = np.argmax(np.stack([mag_r, mag_g, mag_b], axis=0), axis=0)
+
+    gx_strong = np.choose(idx_max, [gx_r, gx_g, gx_b])
+    gy_strong = np.choose(idx_max, [gy_r, gy_g, gy_b])
+
+    # Calculate edge direction (perpendicular to gradient)
+    # arctan2 gives [-pi, pi]. Edge direction is gradient + 90 degrees (pi/2)
+    edge_dir = np.arctan2(gy_strong, gx_strong) + (np.pi / 2.0)
+
     max_mag = float(mag.max())
     if max_mag < 1e-6:
         # Flat image — every pixel is baseline weight.
         norm = np.ones((h, w), dtype=np.float32)
     else:
         norm = 1.0 + (boost - 1.0) * (mag / max_mag).astype(np.float32)
+
     if alpha_mask is not None:
         norm = norm * (alpha_mask > 0).astype(np.float32)
-    return norm
+
+    return norm, edge_dir.astype(np.float32)
 
 
 def rms_error(

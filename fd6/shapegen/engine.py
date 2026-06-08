@@ -294,7 +294,10 @@ class Engine:
         # `edge_weight` shared-memory buffer starts at the base and is
         # periodically reblended with the residual error map below so unfinished
         # regions get boosted late in generation.
-        self._base_edge_weight: np.ndarray = compute_edge_weight(self.target, self.alpha_mask).astype(np.float32)
+        norm_weight, edge_dir = compute_edge_weight(self.target, self.alpha_mask)
+        self._base_edge_weight: np.ndarray = norm_weight.astype(np.float32)
+        self._edge_dir: np.ndarray = edge_dir.astype(np.float32)
+
         self._edge_weight_shm: shared_memory.SharedMemory | None = shared_memory.SharedMemory(
             create=True, size=self._base_edge_weight.nbytes,
         )
@@ -355,7 +358,9 @@ class Engine:
             try:
                 if PyTorchDiffRenderer is None:
                     raise ImportError("PyTorchDiffRenderer could not be imported earlier.")
-                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight)
+                self._gpu = PyTorchDiffRenderer(self.target, self.alpha_mask, self.edge_weight, self._edge_dir)
+                # Give the GPU backend a reference to the LIVE shared memory edge map so it can sync updates
+                self._gpu._external_edge_weight = self.edge_weight
                 self._backend = "pytorch"
                 logger.warning("Engine init: PyTorchDiffRenderer instantiated successfully.")
             except Exception as exc:
@@ -406,12 +411,132 @@ class Engine:
             self.rms = new_rms
             self.shapes.append(s)
 
+    def _prune_shapes(self) -> None:
+        """Removes shapes that are 100% hidden or contribute insignificantly to the final image."""
+        if not self.shapes:
+            return
+
+        # Boolean mask tracking which pixels are completely occluded by top shapes
+        occluded = np.zeros((self.h, self.w), dtype=bool)
+
+        pruned_shapes = []
+        # Store index for fast partial redraws
+        valid_indices = []
+
+        # Pass 1: 100% Occlusion Culling (Fast)
+        for i, s in reversed(list(enumerate(self.shapes))):
+            mask_local, bbox = s.rasterize_mask(self.w, self.h)
+            x0, y0, x1, y1 = bbox
+
+            if x1 <= x0 or y1 <= y0 or mask_local.size == 0:
+                continue
+
+            shape_body = mask_local > 0
+            if not shape_body.any():
+                continue
+
+            region_occluded = occluded[y0:y1, x0:x1]
+
+            if np.all(region_occluded[shape_body]):
+                # 100% occluded, drop it
+                continue
+
+            pruned_shapes.append(s)
+            valid_indices.append(i)
+
+            if s.color[3] >= 254:
+                solid_body = mask_local >= 254
+                region_occluded[solid_body] = True
+
+        pruned_shapes.reverse()
+        valid_indices.reverse()
+
+        occlusion_removed = len(self.shapes) - len(pruned_shapes)
+
+        # Pass 2: Contribution Pruning (Slightly slower, extremely effective)
+        # We start from the bottom layer and ask: "If we don't draw this shape, does the final canvas change much?"
+        # To do this efficiently, we maintain a "running canvas" representing the layers drawn so far.
+
+        final_shapes = []
+        contribution_removed = 0
+        scored_shapes = []
+
+        if self.alpha_mask is not None:
+            mask3 = (self.alpha_mask > 0)[:, :, None]
+            base_canvas = np.full((self.h, self.w, 3), 40, dtype=np.uint8)
+        else:
+            avg = self.target.reshape(-1, 3).mean(axis=0).astype(np.uint8)
+            base_canvas = np.tile(avg, (self.h, self.w, 1)).astype(np.uint8)
+
+        running_canvas = base_canvas.copy()
+
+        for idx, s in enumerate(pruned_shapes):
+            mask_local, bbox = s.rasterize_mask(self.w, self.h)
+            x0, y0, x1, y1 = bbox
+
+            # Draw the shape locally onto the running canvas to see its *immediate* impact
+            region_cur = running_canvas[y0:y1, x0:x1].astype(np.float32)
+
+            if self.alpha_mask is not None:
+                region_alpha = self.alpha_mask[y0:y1, x0:x1]
+                effective_mask = np.minimum(mask_local, region_alpha)
+            else:
+                effective_mask = mask_local
+
+            a = s.color[3] / 255.0
+            src = np.array(s.color[:3], dtype=np.float32)
+            m = (effective_mask.astype(np.float32) / 255.0)[:, :, None]
+
+            blended = m * (a * src + (1.0 - a) * region_cur) + (1.0 - m) * region_cur
+
+            # Calculate how much this shape actually changed the pixels underneath it
+            diff = np.abs(blended - region_cur)
+            max_change = diff.max()
+
+            # If the shape barely changed any pixel's color (e.g. less than 2/255 out of RGB),
+            # or its opacity is so low it does almost nothing, we drop it.
+            # This catches shapes that are 99% occluded or practically invisible.
+            if max_change < 2.0:
+                contribution_removed += 1
+                continue
+
+            # Total color impact score (used for prune_to targeting)
+            impact_score = float(diff.sum())
+            scored_shapes.append((impact_score, idx, s))
+
+            # If it contributed enough, we commit it to the running canvas
+            running_canvas[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
+            final_shapes.append(s)
+
+        # Pass 3: Aggressive Target Pruning
+        # If the user requested a hard cap (e.g., prune down to 2000 shapes), we delete the
+        # shapes with the lowest visual impact scores.
+        target_cap = getattr(self.profile, "prune_to", 0)
+        target_removed = 0
+
+        if target_cap > 0 and len(final_shapes) > target_cap:
+            # Sort by impact score descending (highest impact first)
+            scored_shapes.sort(key=lambda item: item[0], reverse=True)
+
+            # Keep only the top `target_cap` shapes
+            kept_scored_shapes = scored_shapes[:target_cap]
+            target_removed = len(final_shapes) - target_cap
+
+            # Re-sort by original index to maintain the correct draw order (Z-index)
+            kept_scored_shapes.sort(key=lambda item: item[1])
+            final_shapes = [item[2] for item in kept_scored_shapes]
+
+        if occlusion_removed > 0 or contribution_removed > 0 or target_removed > 0:
+            logger.info(f"Pruned {occlusion_removed} occluded, {contribution_removed} negligible, and {target_removed} target-cap shapes.")
+
+        self.shapes = final_shapes
+
     # Residual reblend disabled in v0.4.0 — the size-schedule + edge-weight
     # combination already moves enough budget into detail regions on its own;
     # leaving the residual on top biased the back-half of generation toward
     # smearing big shapes over high-error areas (the opposite of what we
     # want). Flip RESIDUAL_REFRESH_EVERY back to a finite value to re-enable.
-    RESIDUAL_REFRESH_EVERY = 0
+    RESIDUAL_REFRESH_EVERY = 20
     RESIDUAL_BOOST = 4.0
 
     def _refresh_residual_weight(self) -> None:
@@ -427,8 +552,11 @@ class Engine:
         boost = 1.0 + (self.RESIDUAL_BOOST - 1.0) * diff.astype(np.float32)
         self.edge_weight[:] = self._base_edge_weight * boost
 
-    def _max_size_frac_for_progress(self, progress: float) -> float:
+    def _max_size_frac_for_progress(self, shape_count: int, progress: float) -> float:
         """Shape-size schedule. Monotonically decreasing across iteration progress.
+
+        Allows the first 20 shapes to be up to 100% of the canvas size to serve
+        as large background fills.
 
         Per-candidate scoring cost is O(bbox_area) and bbox area scales with
         `max_size_frac²`, so an early tier with `max_size_frac=1.0` (canvas-
@@ -437,6 +565,9 @@ class Engine:
         tonal coverage) without exploding scoring cost at higher
         max_resolutions (4K / 8K targets).
         """
+        if shape_count < 20:
+            return 1.0         # First 20 shapes: 100% canvas for background fills
+
         if progress < 0.25:
             return 0.30        # 0–25%: ~30% canvas — modest bump over legacy for tonal blocks
         if progress < 0.50:
@@ -507,8 +638,8 @@ class Engine:
         """
         if self._backend == "pytorch" and self._gpu is not None:
             try:
-                # PyTorch backend needs to know which type to search for
-                self._gpu._current_type = types[0] if types else "rotated_ellipse"
+                # PyTorch backend needs to know which types to search for
+                self._gpu._current_types = types if types else ["rotated_ellipse"]
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
             except Exception as exc:
                 self._backend = "cpu"
@@ -551,11 +682,11 @@ class Engine:
                 while self._pause and not self._stop:
                     time.sleep(0.05)
 
-                iter_types = [types[type_cursor % len(types)]]
-                type_cursor += 1
+                iter_types = types
 
-                progress = len(self.shapes) / max(1, p.stop_at)
-                size_cap = self._max_size_frac_for_progress(progress)
+                shape_count = len(self.shapes)
+                progress = shape_count / max(1, p.stop_at)
+                size_cap = self._max_size_frac_for_progress(shape_count, progress)
 
                 refined_score, refined = self._search(
                     iter_types, max(1, p.random_samples), max(1, p.mutated_samples),
@@ -627,6 +758,9 @@ class Engine:
                 if count in save_at or (p.save_every and count % p.save_every == 0):
                     yield EngineEvent(kind="checkpoint", shape_count=count, rms=self.rms)
 
+            # Final occlusion culling
+            self._prune_shapes()
+
             yield EngineEvent(kind="done", shape_count=len(self.shapes), rms=self.rms, canvas=self._preview_canvas())
         except EngineWorkerError as exc:
             # Already a user-facing, actionable message — show it as-is.
@@ -637,6 +771,12 @@ class Engine:
             self._shutdown()
 
     def _shutdown(self) -> None:
+        try:
+            if self._backend == "pytorch" and self._gpu is not None:
+                if hasattr(self._gpu, "shutdown"):
+                    self._gpu.shutdown()
+        except Exception:
+            pass
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
