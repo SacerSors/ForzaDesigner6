@@ -644,6 +644,7 @@ class Engine:
                 self._backend = "cpu"
                 self._gpu = None
                 self._gpu_fallback_reason = f"{type(exc).__name__}: {exc}"
+                logger.warning("fallback to CPU because: " + str(self._gpu_fallback_reason)+" trace:\n")
         elif self._backend == "gpu" and self._gpu is not None:
             try:
                 return self._gpu.search(self.canvas, n_random, n_mutate, max_size_frac, self.rng)
