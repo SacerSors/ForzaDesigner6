@@ -317,6 +317,16 @@ class PyTorchDiffRenderer:
             torch.cuda.empty_cache()
 
     def search(self, canvas: np.ndarray, n_random: int, n_mutate: int, max_size_frac: Optional[float], rng: random.Random) -> tuple[float, Optional[Shape]]:
+        # Scale down sample count for large shapes to drastically improve performance
+        # without losing detail quality (which is needed mostly for tiny shapes).
+        if max_size_frac is not None:
+            if max_size_frac >= 0.5:
+                n_random = int(n_random * 0.1)
+            elif max_size_frac >= 0.3:
+                n_random = int(n_random * 0.25)
+            elif max_size_frac >= 0.15:
+                n_random = int(n_random * 0.5)
+
         # Collect available shape types
         types = ["rotated_ellipse"] # default fallback
         if hasattr(self, '_current_types') and self._current_types:
