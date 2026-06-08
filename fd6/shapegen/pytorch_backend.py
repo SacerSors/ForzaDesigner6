@@ -225,12 +225,19 @@ class PyTorchDiffRenderer:
 
         m = mask.unsqueeze(-1)
         color_view = color.view(B, 1, 1, 3)
-        blended = cur_t + m * a_view * (color_view - cur_t)
+
+        # Optimize the error difference math to avoid allocating (cur_t - tgt_t)**2
+        # blended = cur_t + delta
+        delta = m * a_view * (color_view - cur_t)
         w_t = edge_t.unsqueeze(-1)
 
-        region_old = (w_t * (cur_t - tgt_t) ** 2).sum(dim=(1, 2, 3))
-        region_new = (w_t * (blended - tgt_t) ** 2).sum(dim=(1, 2, 3))
-        total = full_sq - region_old + region_new
+        # change = region_new - region_old
+        # = sum(w_t * ( (cur_t - tgt_t + delta)**2 - (cur_t - tgt_t)**2 ))
+        # = sum(w_t * ( 2*(cur_t - tgt_t)*delta + delta**2 ))
+        diff_ct = cur_t - tgt_t
+        change = (w_t * (2.0 * diff_ct * delta + delta ** 2)).sum(dim=(1, 2, 3))
+
+        total = full_sq + change
 
         n = n_weight if n_weight >= 1.0 else 1.0
         score = torch.sqrt(torch.clamp(total, min=0.0) / n)
