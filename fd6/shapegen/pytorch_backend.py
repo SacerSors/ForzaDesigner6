@@ -31,7 +31,7 @@ class PyTorchDiffRenderer:
     using the Adam optimizer with an edge-weighted MSE loss over SDFs.
     """
 
-    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray, edge_dir: Optional[np.ndarray] = None) -> None:
+    def __init__(self, target: np.ndarray, alpha_mask: Optional[np.ndarray], edge_weight: np.ndarray) -> None:
         if torch is None:
             raise RuntimeError("PyTorch is not available.")
 
@@ -44,11 +44,6 @@ class PyTorchDiffRenderer:
         self.target = torch.from_numpy(np.array(target, copy=True)).float().to(self.device) / 255.0
         self.edge_weight = torch.from_numpy(np.array(edge_weight, copy=True)).float().to(self.device)
         self.n_weight = float(self.edge_weight.sum().item()) * 3.0
-
-        if edge_dir is not None:
-            self.edge_dir = torch.from_numpy(np.array(edge_dir, copy=True)).float().to(self.device)
-        else:
-            self.edge_dir = torch.zeros((self.h, self.w), dtype=torch.float32, device=self.device)
 
         if alpha_mask is not None:
             self.alpha_mask = torch.from_numpy(np.array(alpha_mask, copy=True)).float().to(self.device) / 255.0
@@ -133,9 +128,7 @@ class PyTorchDiffRenderer:
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap if shape_type != "circle" else rx_cap)
             if shape_type == "rotated_ellipse":
-                cx = torch.clamp(out[:, 0].long(), 0, w - 1)
-                cy = torch.clamp(out[:, 1].long(), 0, h - 1)
-                out[:, 4] = self.edge_dir[cy, cx]
+                uniform(4, 0.0, 2 * math.pi)
             else:
                 out[:, 4] = 0.0
 
@@ -143,17 +136,13 @@ class PyTorchDiffRenderer:
             uniform(2, 1, rx_cap)
             uniform(3, 1, ry_cap)
             if shape_type == "rotated_rectangle":
-                cx = torch.clamp(out[:, 0].long(), 0, w - 1)
-                cy = torch.clamp(out[:, 1].long(), 0, h - 1)
-                out[:, 4] = self.edge_dir[cy, cx]
+                uniform(4, 0.0, 2 * math.pi)
             else:
                 out[:, 4] = 0.0
 
         elif shape_type == "triangle":
             uniform(2, 10, max(10, w * (max_size_frac or 0.25)))
-            cx = torch.clamp(out[:, 0].long(), 0, w - 1)
-            cy = torch.clamp(out[:, 1].long(), 0, h - 1)
-            out[:, 3] = self.edge_dir[cy, cx]
+            uniform(3, 0.0, 2 * math.pi)
             uniform(4, 0.5, 2.0)
         else:
             raise ValueError(f"Unsupported shape type: {shape_type}")
@@ -303,15 +292,18 @@ class PyTorchDiffRenderer:
         # Dynamic Alpha from params, clamped to [0.01, 1.0] to prevent div-by-zero
         a = torch.clamp(params[:, 5], 0.01, 1.0)
 
-        a_view = a.view(B, 1, 1)
+        a_view = a.view(B, 1, 1, 1) # (B, 1, 1, 1)
 
         # Optimal color
         eff_sum = eff.sum(dim=(1, 2)) # (B,)
         denom = eff_sum * a
 
         # numer = sum(eff * (tgt - (1-a)*cur))
-        diff = tgt_t - (1.0 - a_view).unsqueeze(-1) * cur_t # (B, T, T, 3)
-        numer = (eff.unsqueeze(-1) * diff).sum(dim=(1, 2)) # (B, 3)
+        # use a_view directly without .unsqueeze(-1)
+        diff = tgt_t - (1.0 - a_view) * cur_t # (B, T, T, 3)
+
+        eff_u = eff.unsqueeze(-1) # (B, T, T, 1)
+        numer = (eff_u * diff).sum(dim=(1, 2)) # (B, 3)
 
         safe = eff_sum > 0.5
         denom_safe = torch.where(safe, denom, torch.ones_like(denom))
@@ -320,8 +312,8 @@ class PyTorchDiffRenderer:
 
         # Blended image
         m = mask.unsqueeze(-1) # (B, T, T, 1)
-        a_view_4 = a.view(B, 1, 1, 1)
-        blended = m * (a_view_4 * color.view(B, 1, 1, 3) + (1.0 - a_view_4) * cur_t) + (1.0 - m) * cur_t
+        color_view = color.view(B, 1, 1, 3)
+        blended = m * (a_view * color_view + (1.0 - a_view) * cur_t) + (1.0 - m) * cur_t
 
         w_t = edge_t.unsqueeze(-1) # (B, T, T, 1)
 
@@ -445,7 +437,9 @@ class PyTorchDiffRenderer:
         T = max(2, int(min(max(self.w, self.h), 2 * math.ceil(global_max_r * 1.5) + 40)))
 
         # Dynamic Chunk Sizing based on global T
-        bytes_per_tile = T * T * 3 * 4
+        # Accounting for actual VRAM usage during scoring (grid, cur_t, tgt_t, alpha_t, edge_t, mask, diff, eff, etc)
+        # ~20 floats per pixel. 20 * 4 bytes = 80 bytes per pixel.
+        bytes_per_tile = T * T * 20 * 4
         chunk_size = max(2, int((256 * 1024 * 1024) / max(1, bytes_per_tile)))
         chunk_size = min(chunk_size, n_random)
 
